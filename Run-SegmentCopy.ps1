@@ -558,6 +558,15 @@ $fullInput = $null
 $runTimeoutAtUtc = [DateTime]::UtcNow.AddSeconds($RunTimeoutSeconds)
 Write-Host "Run timeout: ${RunTimeoutSeconds}s"
 
+trap {
+    if (-not $DryRun -and (Get-Command Invoke-DlnaWorkflowQuitCleanup -ErrorAction SilentlyContinue)) {
+        try { [void](Invoke-DlnaWorkflowQuitCleanup) } catch { }
+    } elseif (Get-Command Remove-DlnaSegmentRootSubst -ErrorAction SilentlyContinue) {
+        try { [void](Remove-DlnaSegmentRootSubst) } catch { }
+    }
+    break
+}
+
 if ($DryRun) {
     Write-Host 'DryRun: skipping segment job mutex (no ffmpeg, no segment files).'
 } else {
@@ -1031,6 +1040,9 @@ DLNA idle monitoring (legacy): after both segment files exist, ffmpeg stops if m
             if ($tail) { Write-Host ($tail -join [Environment]::NewLine) }
         } catch { }
     }
+} catch [System.Management.Automation.PipelineStoppedException] {
+    Write-Host 'Ctrl+C / stop — running DLNA quit cleanup...'
+    $exitCode = $script:ExitCodeUserCancel
 } catch {
     Write-Warning ("Segment remux failed: {0}" -f $_.Exception.Message)
     if ($exitCode -eq 0) { $exitCode = 1 }

@@ -28,7 +28,7 @@ The letter is **always F:** — not a random free drive. Skybox is configured fo
 | F: at start | What happens |
 |-------------|--------------|
 | Absent (unmapped) | This run **creates** `subst F:` → `%AppData%\f1_media_F_subst` (same mount as `3d_playlist_local`); junction → `%AppData%\3d_loop_segments` if that path is not already a folder/junction. On quit: full-tree obfuscate, then **`subst F: /d`**. |
-| Existing AppData subst (including playlist’s `f1_media_F_subst`) | **Reuse** that mapping. Write to `F:\f1_media\3d_fullsbs_trans`. Do not steal or `subst /d` on quit. Obfuscate **top-level** share files only (leave `flat\` / `fisheye\` / `hybrid\` alone). |
+| Existing AppData subst (including playlist’s `f1_media_F_subst`) | **Reuse** that mapping. Write to `F:\f1_media\3d_fullsbs_trans`. Physical files follow the **existing** `3d_fullsbs_trans` junction (typically `%AppData%\3d_playlist_local`), **not** `%AppData%\3d_loop_segments`. Do not steal or `subst /d` on quit. Obfuscate recursively, including **`fisheye_temp\`**; skip live playlist segment dirs **`flat\` / `fisheye\` / `hybrid\`** only. |
 | Physical drive or non-AppData `subst` | **Error** — free `F:` before running. |
 
 On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `F:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell **`F:`** drive (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive F:** and context-menu runs fail).
@@ -37,8 +37,8 @@ On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `F:` **only if this 
 
 Same pattern as `3d_playlist_local`:
 
-- **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` files using scrambled **`.dlna_obf_map.json`** in the DLNA root (`3d_op_00.mkv` / `3d_op_01.mkv` and any `.avs` / `.avsi` names come back).
-- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`): stops leaf ffmpeg, renames media **and AviSynth scripts** (`.avs` / `.avsi`) to `<sha256(relativePath)>.tmp`, writes/updates the map. **`subst F: /d`** only if **this run created** the dummy drive (unmapped `F:` at start). If playlist already had `F:` subst’d, the mapping stays.
+- **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` files using this script’s scrambled **`.dlna_obf_map.3d_loop_segments.json`** (`3d_op_00.mkv` / `3d_op_01.mkv` and any `.avs` / `.avsi` names come back). If the clear name already exists, the restored file **overwrites** it so ffmpeg can then `-y` replace in place instead of creating a second file. Does not use playlist’s `.dlna_obf_map.json` (different key; playlist deletes that file when decrypt fails).
+- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`, plus a **Ctrl+C** `trap`): stops leaf ffmpeg, renames media **and AviSynth scripts** (`.avs` / `.avsi`) to `<sha256(relativePath)>.tmp`, writes **`.dlna_obf_map.3d_loop_segments.json`** — including **`fisheye_temp\`**. **`subst F: /d`** only if **this run created** the dummy drive. If playlist already had `F:` subst’d, the mapping stays; live **`flat\` / `fisheye\` / `hybrid\`** segment dirs are not renamed.
 - **Manual delete:** `Cleanup-DlnaSegmentRoot.ps1` (calls `Clear-DlnaSegmentRootContents`).
 - **Keep logs on error:** non-zero exit codes other than timeout (**124**), DLNA idle (**125**), and user cancel (**130**) pass `-KeepLogs` to the obfuscator (rarely needed here; segment logs live under `segmentcopy_logs\` beside the script).
 
