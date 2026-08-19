@@ -5,14 +5,17 @@ $script:LeafFfmpegExportSuspended = $false
 $script:LeafFfmpegSuspendedPids = [System.Collections.Generic.List[int]]::new()
 # Segment mux passes the ffmpeg pattern (3d_op_%02d.mkv), not literal slot filenames.
 $script:LeafFfmpegOutputLeaves = @('3d_op_00.mkv', '3d_op_01.mkv', '3d_op_%02d.mkv')
-# Preferred Skybox DLNA share path. Files live under %AppData%; F: is always our subst for the run.
+# Preferred Skybox DLNA share path. Files live under %AppData%; dummy F: via subst (same mount as 3d_playlist_local).
 $script:DlnaSegmentRootPreferred = 'F:\f1_media\3d_fullsbs_trans'
 $script:DlnaSegmentRootDefault = $script:DlnaSegmentRootPreferred
 $script:DlnaSegmentRootDriveLetter = 'F'
 $script:DlnaSegmentRootAppDataLeaf = '3d_loop_segments'
-$script:DlnaSegmentRootSubstLeaf = '3d_loop_segments_F_subst'
+# Must match 3d_playlist_local so both workflows can share one subst F: -> Skybox path.
+$script:DlnaSegmentRootSubstLeaf = 'f1_media_F_subst'
 $script:DlnaSegmentRootEnsured = $false
 $script:DlnaSegmentRootEnsureMode = ''
+$script:DlnaSegmentRootOwnedSubst = $false
+$script:DlnaSegmentRootSharedSubst = $false
 $script:DlnaWorkflowQuitCleanupDone = $false
 # Quit hides media from DLNA by renaming; startup restores via scrambled map.
 $script:DlnaObfuscationMapLeaf = '.dlna_obf_map.json'
@@ -23,7 +26,8 @@ $script:DlnaObfuscationPrefix = '_dlna_obf_'
 $script:DlnaObfuscationSuffix = '.dlna_obf'
 $script:DlnaMediaExtensions = @(
     '.mkv', '.mp4', '.m4v', '.mov', '.webm', '.ts', '.m2ts', '.mts',
-    '.avi', '.wmv', '.mpg', '.mpeg', '.m2v', '.flv', '.3gp', '.ogv', '.ogg'
+    '.avi', '.wmv', '.mpg', '.mpeg', '.m2v', '.flv', '.3gp', '.ogv', '.ogg',
+    '.avs', '.avsi'
 )
 
 function Get-DlnaSegmentRootAppDataFallback {
@@ -85,13 +89,20 @@ function Join-DlnaNetPath {
 }
 
 function Register-DlnaSubstPsDrive {
-    param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
+    param(
+        [string] $Letter = $script:DlnaSegmentRootDriveLetter,
+        [string] $MountPath = ''
+    )
     $name = $Letter.TrimEnd(':')
-    $mount = Get-DlnaSegmentRootSubstMount
+    $mount = if (-not [string]::IsNullOrWhiteSpace($MountPath)) {
+        [System.IO.Path]::GetFullPath($MountPath)
+    } else {
+        $fromSubst = Get-SubstDriveTarget -Letter $name
+        if (-not [string]::IsNullOrWhiteSpace($fromSubst)) { $fromSubst } else { Get-DlnaSegmentRootSubstMount }
+    }
     $existing = Get-PSDrive -Name $name -PSProvider FileSystem -ErrorAction SilentlyContinue
     if ($null -ne $existing) { return $true }
     try {
-        # subst is visible to Win32 but not to this session's FileSystem provider until mapped.
         New-PSDrive -Name $name -PSProvider FileSystem -Root $mount -Scope Global -ErrorAction Stop | Out-Null
         return $true
     } catch {
@@ -103,15 +114,7 @@ function Register-DlnaSubstPsDrive {
 function Unregister-DlnaSubstPsDrive {
     param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
     $name = $Letter.TrimEnd(':')
-    $drv = Get-PSDrive -Name $name -PSProvider FileSystem -ErrorAction SilentlyContinue
-    if ($null -eq $drv) { return }
-    try {
-        $mount = Get-DlnaSegmentRootSubstMount
-        $root = [string]$drv.Root
-        if (-not $root.TrimEnd('\').Equals($mount.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
-            return
-        }
-    } catch { }
+    if ($null -eq (Get-PSDrive -Name $name -PSProvider FileSystem -ErrorAction SilentlyContinue)) { return }
     try { Remove-PSDrive -Name $name -Force -ErrorAction SilentlyContinue } catch { }
 }
 
@@ -129,18 +132,7 @@ function Ensure-DirectoryJunction {
         $item = Get-Item -LiteralPath $linkFull -Force
         $isReparse = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
         if ($isReparse) {
-            $existingTarget = $null
-            try {
-                if ($null -ne $item.Target -and $item.Target.Count -gt 0) {
-                    $existingTarget = [System.IO.Path]::GetFullPath([string]$item.Target[0])
-                }
-            } catch { }
-            if ([string]::IsNullOrWhiteSpace($existingTarget) -or
-                -not $existingTarget.Equals($targetFull, [StringComparison]::OrdinalIgnoreCase)) {
-                cmd.exe /c rmdir "$linkFull" | Out-Null
-            } else {
-                return $linkFull
-            }
+            return $linkFull
         } else {
             return $linkFull
         }
@@ -179,11 +171,22 @@ function Ensure-DlnaSegmentRootDirectory {
     [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetFullPath($Root))
 }
 
+function Test-DlnaSubstTargetIsShareable {
+    param([string] $SubstTarget)
+    if ([string]::IsNullOrWhiteSpace($SubstTarget)) { return $false }
+    $appData = [Environment]::GetFolderPath('ApplicationData')
+    if ([string]::IsNullOrWhiteSpace($appData)) { $appData = $env:APPDATA }
+    if ([string]::IsNullOrWhiteSpace($appData)) { return $false }
+    $appFull = [System.IO.Path]::GetFullPath($appData).TrimEnd('\')
+    $tgt = [System.IO.Path]::GetFullPath($SubstTarget)
+    return $tgt.StartsWith($appFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Ensure-DlnaSegmentRoot {
     <#
     .SYNOPSIS
-      Skybox path F:\f1_media\3d_fullsbs_trans is always backed by %AppData%\3d_loop_segments via
-      subst F: + directory junction. Does not use a physical F: volume.
+      Skybox path F:\f1_media\3d_fullsbs_trans via subst F: (same mount as 3d_playlist_local).
+      Reuses an existing AppData subst of F: instead of failing. Does not use a physical F: volume.
     #>
     param([switch] $Force)
     if ($script:DlnaSegmentRootEnsured -and -not $Force.IsPresent) {
@@ -194,37 +197,50 @@ function Ensure-DlnaSegmentRoot {
     $appDataRoot = Get-DlnaSegmentRootAppDataFallback
     $substMount = Get-DlnaSegmentRootSubstMount
     $letter = $script:DlnaSegmentRootDriveLetter
+    $script:DlnaSegmentRootOwnedSubst = $false
+    $script:DlnaSegmentRootSharedSubst = $false
 
     [void][System.IO.Directory]::CreateDirectory($appDataRoot)
-    [void][System.IO.Directory]::CreateDirectory((Join-Path $substMount 'f1_media'))
-    [void](Ensure-DirectoryJunction -LinkPath (Join-Path $substMount 'f1_media\3d_fullsbs_trans') -TargetPath $appDataRoot)
 
     $existingSubst = Get-SubstDriveTarget -Letter $letter
-    if (-not [string]::IsNullOrWhiteSpace($existingSubst) -and
-        -not $existingSubst.Equals($substMount, [StringComparison]::OrdinalIgnoreCase)) {
-        throw ("Drive {0}: is already subst'd to {1}; cannot map DLNA mount {2}." -f `
-            $letter, $existingSubst, $substMount)
+    if (-not [string]::IsNullOrWhiteSpace($existingSubst)) {
+        if (-not (Test-DlnaSubstTargetIsShareable -SubstTarget $existingSubst)) {
+            throw ("Drive {0}: is subst'd to {1} (not under %AppData%); cannot share it for DLNA." -f `
+                $letter, $existingSubst)
+        }
+        $script:DlnaSegmentRootSharedSubst = $true
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $existingSubst 'f1_media'))
+        $junc = Join-Path $existingSubst 'f1_media\3d_fullsbs_trans'
+        if (-not (Test-Path -LiteralPath $junc)) {
+            [void](Ensure-DirectoryJunction -LinkPath $junc -TargetPath $appDataRoot)
+        }
+        [void](Register-DlnaSubstPsDrive -Letter $letter -MountPath $existingSubst)
+        if (-not [System.IO.Directory]::Exists($preferred)) {
+            throw ("Existing {0}: subst ({1}) does not provide Skybox path {2}." -f $letter, $existingSubst, $preferred)
+        }
+        $mode = if ($script:DlnaSegmentRootSharedSubst) { 'shared-subst' } else { 'appdata-subst' }
+        Write-Host ("DLNA root: reusing subst {0}: -> {1} (mode={2}); Skybox path {3}." -f `
+            $letter, $existingSubst, $mode, $preferred)
+        return (Complete-DlnaSegmentRootEnsure -Root $preferred -Mode $mode)
     }
 
-    if ([string]::IsNullOrWhiteSpace($existingSubst)) {
-        if (Test-DlnaSegmentRootDrivePresent -Letter $letter) {
-            throw ("Drive {0}: is present but is not our AppData subst ({1}). Remove or unmount {0}: so this script can subst it for DLNA output." -f `
-                $letter, $substMount)
-        }
-        $substOut = & subst.exe "${letter}:" "$substMount" 2>&1
-        if (-not (Test-DlnaSegmentRootDrivePresent -Letter $letter)) {
-            throw ("Failed to subst {0}: -> {1}: {2}" -f $letter, $substMount, $substOut)
-        }
-        Write-Host ("DLNA root: subst {0}: -> {1}; data under %AppData%\{2}; Skybox path {3}." -f `
-            $letter, $substMount, $script:DlnaSegmentRootAppDataLeaf, $preferred)
+    if (Test-DlnaSegmentRootDrivePresent -Letter $letter) {
+        throw ("Drive {0}: is present but is not an AppData subst. Remove or unmount {0}: so this script can subst it for DLNA output." -f $letter)
     }
 
-    [void](Register-DlnaSubstPsDrive -Letter $letter)
-
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $substMount 'f1_media'))
+    [void](Ensure-DirectoryJunction -LinkPath (Join-Path $substMount 'f1_media\3d_fullsbs_trans') -TargetPath $appDataRoot)
+    $substOut = & subst.exe "${letter}:" "$substMount" 2>&1
+    if (-not (Test-DlnaSegmentRootDrivePresent -Letter $letter)) {
+        throw ("Failed to subst {0}: -> {1}: {2}" -f $letter, $substMount, $substOut)
+    }
+    $script:DlnaSegmentRootOwnedSubst = $true
+    [void](Register-DlnaSubstPsDrive -Letter $letter -MountPath $substMount)
     if (-not [System.IO.Directory]::Exists($preferred)) {
         throw ("DLNA subst/junction setup succeeded but preferred path missing: {0}" -f $preferred)
     }
-
+    Write-Host ("DLNA root: subst {0}: -> {1}; data under %AppData%\{2}; Skybox path {3}." -f `
+        $letter, $substMount, $script:DlnaSegmentRootAppDataLeaf, $preferred)
     return (Complete-DlnaSegmentRootEnsure -Root $preferred -Mode 'appdata-subst')
 }
 
@@ -251,20 +267,26 @@ function Remove-DlnaSegmentRootSubst {
     }
 
     $substTarget = Get-SubstDriveTarget -Letter $letter
+    Unregister-DlnaSubstPsDrive -Letter $letter
     if ([string]::IsNullOrWhiteSpace($substTarget)) {
         if (-not $Quiet.IsPresent) {
             Write-Host ("DLNA root subst cleanup: no {0}: subst mapping (nothing to remove)." -f $letter)
         }
         $script:DlnaSegmentRootEnsured = $false
         $script:DlnaSegmentRootEnsureMode = ''
+        $script:DlnaSegmentRootOwnedSubst = $false
+        $script:DlnaSegmentRootSharedSubst = $false
         return @{ Removed = $false; Reason = 'no-subst' }
     }
-    if (-not $substTarget.Equals($substMount, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $script:DlnaSegmentRootOwnedSubst) {
         if (-not $Quiet.IsPresent) {
-            Write-Host ("DLNA root subst cleanup: {0}: maps to {1} (not our mount); leaving alone." -f `
+            Write-Host ("DLNA root subst cleanup: leaving {0}: -> {1} (shared/existing subst; this run did not create it)." -f `
                 $letter, $substTarget)
         }
-        return @{ Removed = $false; Reason = 'foreign-subst'; Target = $substTarget }
+        $script:DlnaSegmentRootEnsured = $false
+        $script:DlnaSegmentRootEnsureMode = ''
+        $script:DlnaSegmentRootSharedSubst = $false
+        return @{ Removed = $false; Reason = 'shared-subst'; Target = $substTarget }
     }
 
     $junction = [System.IO.Path]::GetFullPath((Join-Path $substMount 'f1_media\3d_fullsbs_trans'))
@@ -285,7 +307,6 @@ function Remove-DlnaSegmentRootSubst {
 
     $substRemoved = $false
     if (-not $DryRun.IsPresent) {
-        Unregister-DlnaSubstPsDrive -Letter $letter
         try {
             & subst.exe "${letter}:" /d 2>&1 | Out-Null
         } catch { }
@@ -297,6 +318,8 @@ function Remove-DlnaSegmentRootSubst {
 
     $script:DlnaSegmentRootEnsured = $false
     $script:DlnaSegmentRootEnsureMode = ''
+    $script:DlnaSegmentRootOwnedSubst = $false
+    $script:DlnaSegmentRootSharedSubst = $false
     $script:DlnaSegmentRootDefault = $script:DlnaSegmentRootPreferred
 
     if (-not $Quiet.IsPresent) {
@@ -617,7 +640,8 @@ function Restore-DlnaObfuscatedMedia {
 
     $map = Read-DlnaObfuscationMap -Root $rootFull
     $mapDirty = $false
-    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force -ErrorAction SilentlyContinue |
+    $obfRecurse = -not $script:DlnaSegmentRootSharedSubst
+    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse:$obfRecurse -Force -ErrorAction SilentlyContinue |
         Where-Object {
             $_.Name -ne $script:DlnaObfuscationMapLeaf -and
             (Test-DlnaObfuscatedFileName -FileName $_.Name)
@@ -766,7 +790,8 @@ function Obfuscate-DlnaSegmentRootMedia {
 
     $map = Read-DlnaObfuscationMap -Root $rootFull
     $mapDirty = $false
-    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force -ErrorAction SilentlyContinue |
+    $obfRecurse = -not $script:DlnaSegmentRootSharedSubst
+    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse:$obfRecurse -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne $script:DlnaObfuscationMapLeaf })
     foreach ($f in $files) {
         if (Test-DlnaLogPath -FullPath $f.FullName) {

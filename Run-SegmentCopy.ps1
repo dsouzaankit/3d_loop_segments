@@ -11,7 +11,7 @@
   README.md: mapped-network input can bottleneck reads; DLNA idle (default Wi-Fi Mbps heuristic) is experimental.
   Console: Space pauses/resumes the segment remux (3d_op_*.mkv) via NtSuspend/NtResume; Enter stops ffmpeg and exits (130).
   DLNA Wi-Fi idle and run timeout (3600s) keep ticking while Space-paused; idle kill (~305s sample history + five low Mbps windows) is independent of ffmpeg suspend.
-  DLNA root: F:\f1_media\3d_fullsbs_trans is always AppData-backed with subst F: for the run. On quit: Obfuscate-DlnaSegmentRootMedia (rename segments to sha256.tmp + .dlna_obf_map.json), then Remove-DlnaSegmentRootSubst; startup restores via Ensure-DlnaSegmentRoot.
+  DLNA root: F:\f1_media\3d_fullsbs_trans via subst F: (%AppData%\f1_media_F_subst, shared with 3d_playlist_local). Reuses an existing AppData subst of F:; subst /d on quit only if this run created it. On quit: obfuscate then optional subst teardown; startup restores via Ensure-DlnaSegmentRoot.
 
 .PARAMETER LiteralPath
   Input file (Explorer passes %L expanded).

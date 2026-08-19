@@ -13,7 +13,7 @@ If **input files** live on a **mapped drive** (SMB share, VPN, NAS, etc.), **rea
   2. Use **wired LAN** and a path that can sustain the **source file’s** peak read rate (not just “average internet speed”).
   3. Reduce competing traffic on the same link while ffmpeg is running.
 
-**Output** uses the Skybox DLNA path **`F:\f1_media\3d_fullsbs_trans`**, always backed by **`%AppData%\3d_loop_segments`**. Each run maps **`subst F:`** → `%AppData%\3d_loop_segments_F_subst` with a junction so ffmpeg and Skybox still see the `F:\...` path. A **physical F: drive must not be mounted** (the script errors if `F:` exists without being our subst). On exit, **`subst F: /d`** and the junction are removed; AppData files remain.
+**Output** uses the Skybox DLNA path **`F:\f1_media\3d_fullsbs_trans`**. Dummy **`subst F:`** uses **`%AppData%\f1_media_F_subst`** (same as `3d_playlist_local`). If that subst is already active, this script **reuses** it. A **physical F: drive** (or a subst not under `%AppData%`) is an error. On exit, **`subst F: /d`** only if **this run** created the mapping.
 
 **Downstream streaming** (e.g. DLNA to a client over a link slower than your media bitrate) is a **separate** bottleneck from “reading the source over SMB.”
 
@@ -25,18 +25,18 @@ Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1`
 
 | F: at start | What happens |
 |-------------|--------------|
-| Absent | `subst F:` → AppData subst mount; junction → `%AppData%\3d_loop_segments`. |
-| Our subst from a prior run | Refresh junction; reuse mapping. |
-| Physical drive or foreign `subst` | **Error** — free `F:` before running. |
+| Absent (unmapped) | This run **creates** `subst F:` → `%AppData%\f1_media_F_subst` (same mount as `3d_playlist_local`); junction → `%AppData%\3d_loop_segments` if that path is not already a folder/junction. On quit: full-tree obfuscate, then **`subst F: /d`**. |
+| Existing AppData subst (including playlist’s `f1_media_F_subst`) | **Reuse** that mapping. Write to `F:\f1_media\3d_fullsbs_trans`. Do not steal or `subst /d` on quit. Obfuscate **top-level** share files only (leave `flat\` / `fisheye\` / `hybrid\` alone). |
+| Physical drive or non-AppData `subst` | **Error** — free `F:` before running. |
 
-On exit, **`Remove-DlnaSegmentRootSubst`** removes our junction and `subst F: /d`. AppData data stays. Subst mount name **`3d_loop_segments_F_subst`** avoids clashing with `3d_playlist_local`. After `subst`, the script also registers a PowerShell **`F:`** drive (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive F:** and context-menu runs fail).
+On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `F:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell **`F:`** drive (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive F:** and context-menu runs fail).
 
 ### Media obfuscation (quit / startup)
 
 Same pattern as `3d_playlist_local`:
 
-- **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` segment files using scrambled **`.dlna_obf_map.json`** in the DLNA root (`3d_op_00.mkv` / `3d_op_01.mkv` names come back).
-- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`): stops leaf ffmpeg, renames media to `<sha256(relativePath)>.tmp`, writes/updates the map, removes `subst F:`. Media is **hidden from DLNA**, not deleted.
+- **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` files using scrambled **`.dlna_obf_map.json`** in the DLNA root (`3d_op_00.mkv` / `3d_op_01.mkv` and any `.avs` / `.avsi` names come back).
+- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`): stops leaf ffmpeg, renames media **and AviSynth scripts** (`.avs` / `.avsi`) to `<sha256(relativePath)>.tmp`, writes/updates the map. **`subst F: /d`** only if **this run created** the dummy drive (unmapped `F:` at start). If playlist already had `F:` subst’d, the mapping stays.
 - **Manual delete:** `Cleanup-DlnaSegmentRoot.ps1` (calls `Clear-DlnaSegmentRootContents`).
 - **Keep logs on error:** non-zero exit codes other than timeout (**124**), DLNA idle (**125**), and user cancel (**130**) pass `-KeepLogs` to the obfuscator (rarely needed here; segment logs live under `segmentcopy_logs\` beside the script).
 
