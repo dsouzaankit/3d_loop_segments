@@ -1,6 +1,7 @@
 # Runtime logs
 segmentcopy_logs/
 *.log
+.dlna_obf_map.json
 
 # OS / editor
 Thumbs.db

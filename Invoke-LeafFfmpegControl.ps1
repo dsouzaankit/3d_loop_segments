@@ -13,6 +13,18 @@ $script:DlnaSegmentRootAppDataLeaf = '3d_loop_segments'
 $script:DlnaSegmentRootSubstLeaf = '3d_loop_segments_F_subst'
 $script:DlnaSegmentRootEnsured = $false
 $script:DlnaSegmentRootEnsureMode = ''
+$script:DlnaWorkflowQuitCleanupDone = $false
+# Quit hides media from DLNA by renaming; startup restores via scrambled map.
+$script:DlnaObfuscationMapLeaf = '.dlna_obf_map.json'
+$script:DlnaObfuscationMapMagic = 'DLNAOBF1:'
+$script:DlnaObfuscationMapKeyMaterial = '3d_loop_segments.dlna_obf_map.v1'
+$script:DlnaObfuscationTmpSuffix = '.tmp'
+$script:DlnaObfuscationPrefix = '_dlna_obf_'
+$script:DlnaObfuscationSuffix = '.dlna_obf'
+$script:DlnaMediaExtensions = @(
+    '.mkv', '.mp4', '.m4v', '.mov', '.webm', '.ts', '.m2ts', '.mts',
+    '.avi', '.wmv', '.mpg', '.mpeg', '.m2v', '.flv', '.3gp', '.ogv', '.ogg'
+)
 
 function Get-DlnaSegmentRootAppDataFallback {
     $appData = [Environment]::GetFolderPath('ApplicationData')
@@ -115,7 +127,17 @@ function Complete-DlnaSegmentRootEnsure {
     $script:DlnaSegmentRootDefault = $root
     $script:DlnaSegmentRootEnsureMode = $Mode
     $script:DlnaSegmentRootEnsured = $true
+    try {
+        [void](Restore-DlnaObfuscatedMedia -Root $root)
+    } catch {
+        Write-Warning ("DLNA root restore obfuscated media failed: {0}" -f $_.Exception.Message)
+    }
     return $root
+}
+
+function Ensure-DlnaSegmentRootDirectory {
+    param([Parameter(Mandatory = $true)][string] $Root)
+    [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetFullPath($Root))
 }
 
 function Ensure-DlnaSegmentRoot {
@@ -246,6 +268,621 @@ function Remove-DlnaSegmentRootSubst {
         JunctionRemoved = $junctionRemoved
         SubstRemoved    = $substRemoved
         Mount           = $substMount
+    }
+}
+
+function Invoke-DlnaWorkflowQuitCleanup {
+    <#
+    .SYNOPSIS
+      Idempotent workflow quit: obfuscate media under DLNA root, then remove dummy F: subst.
+    #>
+    param(
+        [switch] $KeepLogs,
+        [switch] $Quiet,
+        [switch] $DryRun
+    )
+    if ($script:DlnaWorkflowQuitCleanupDone -and -not $DryRun.IsPresent) {
+        return @{ Done = $true; Skipped = $true }
+    }
+    if (-not $DryRun.IsPresent) {
+        $script:DlnaWorkflowQuitCleanupDone = $true
+    }
+
+    $obf = $null
+    $subst = $null
+    try {
+        if (Get-Command Obfuscate-DlnaSegmentRootMedia -ErrorAction SilentlyContinue) {
+            $obf = Obfuscate-DlnaSegmentRootMedia -KeepLogs:$KeepLogs.IsPresent -Quiet:$Quiet.IsPresent -DryRun:$DryRun.IsPresent
+        }
+    } catch {
+        Write-Warning ("DLNA root media obfuscate on quit failed: {0}" -f $_.Exception.Message)
+    }
+    try {
+        if (Get-Command Remove-DlnaSegmentRootSubst -ErrorAction SilentlyContinue) {
+            $subst = Remove-DlnaSegmentRootSubst -Quiet:$Quiet.IsPresent -DryRun:$DryRun.IsPresent
+        }
+    } catch {
+        Write-Warning ("DLNA root F: subst cleanup on quit failed: {0}" -f $_.Exception.Message)
+    }
+    return @{ Done = $true; Skipped = $false; Obfuscate = $obf; Subst = $subst }
+}
+
+function Stop-LeafFfmpegExport {
+    $pids = @(Get-LeafFfmpegProcessIds)
+    $stopped = 0
+    foreach ($procId in $pids) {
+        try {
+            & taskkill.exe /PID $procId /T /F 2>$null | Out-Null
+            $stopped++
+        } catch { }
+    }
+    $script:LeafFfmpegExportSuspended = $false
+    if ($null -ne $script:LeafFfmpegSuspendedPids) {
+        $script:LeafFfmpegSuspendedPids.Clear()
+    }
+    return $stopped
+}
+
+function Test-DlnaMediaFileName {
+    param([Parameter(Mandatory = $true)][string] $FileName)
+    $ext = [System.IO.Path]::GetExtension($FileName)
+    if ([string]::IsNullOrWhiteSpace($ext)) { return $false }
+    return $script:DlnaMediaExtensions -contains $ext.ToLowerInvariant()
+}
+
+function Get-DlnaPathRelativeToRoot {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][string] $FullPath
+    )
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $full = [System.IO.Path]::GetFullPath($FullPath)
+    if ($full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return $full.Substring($rootFull.Length).TrimStart('\', '/')
+    }
+    return [System.IO.Path]::GetFileName($FullPath)
+}
+
+function Get-DlnaObfuscationMapPath {
+    param([Parameter(Mandatory = $true)][string] $Root)
+    return [System.IO.Path]::GetFullPath((Join-Path $Root $script:DlnaObfuscationMapLeaf))
+}
+
+function Get-DlnaObfuscationMapKeyBytes {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($script:DlnaObfuscationMapKeyMaterial))
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Protect-DlnaObfuscationMapText {
+    param([Parameter(Mandatory = $true)][string] $PlainText)
+    $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
+    $key = Get-DlnaObfuscationMapKeyBytes
+    $out = New-Object byte[] $plainBytes.Length
+    for ($i = 0; $i -lt $plainBytes.Length; $i++) {
+        $out[$i] = $plainBytes[$i] -bxor $key[$i % $key.Length]
+    }
+    return ($script:DlnaObfuscationMapMagic + [Convert]::ToBase64String($out))
+}
+
+function Unprotect-DlnaObfuscationMapText {
+    param([Parameter(Mandatory = $true)][string] $ProtectedText)
+    $raw = $ProtectedText.Trim()
+    if (-not $raw.StartsWith($script:DlnaObfuscationMapMagic, [StringComparison]::Ordinal)) {
+        return $null
+    }
+    $b64 = $raw.Substring($script:DlnaObfuscationMapMagic.Length)
+    try {
+        $bytes = [Convert]::FromBase64String($b64)
+    } catch {
+        return $null
+    }
+    $key = Get-DlnaObfuscationMapKeyBytes
+    $out = New-Object byte[] $bytes.Length
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        $out[$i] = $bytes[$i] -bxor $key[$i % $key.Length]
+    }
+    return [System.Text.Encoding]::UTF8.GetString($out)
+}
+
+function ConvertFrom-DlnaObfuscationMapJson {
+    param([Parameter(Mandatory = $true)][string] $JsonText)
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($JsonText)) { return $map }
+    $doc = $JsonText | ConvertFrom-Json
+    if ($null -eq $doc) { return $map }
+    foreach ($p in $doc.PSObject.Properties) {
+        if ([string]::IsNullOrWhiteSpace($p.Name) -or $null -eq $p.Value) { continue }
+        $map[[string]$p.Name] = [string]$p.Value
+    }
+    return $map
+}
+
+function Read-DlnaObfuscationMap {
+    param([Parameter(Mandatory = $true)][string] $Root)
+    $map = @{}
+    $path = Get-DlnaObfuscationMapPath -Root $Root
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $map }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $map }
+        $json = Unprotect-DlnaObfuscationMapText -ProtectedText $raw
+        if ([string]::IsNullOrWhiteSpace($json)) { $json = $raw }
+        $map = ConvertFrom-DlnaObfuscationMapJson -JsonText $json
+    } catch { }
+    return $map
+}
+
+function Write-DlnaObfuscationMap {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)]$Map,
+        [switch] $DryRun
+    )
+    $path = Get-DlnaObfuscationMapPath -Root $Root
+    if ($DryRun.IsPresent) { return }
+    if ($null -eq $Map -or $Map.Count -eq 0) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+        return
+    }
+    $ordered = [ordered]@{}
+    foreach ($key in @($Map.Keys | Sort-Object)) {
+        $ordered[$key] = $Map[$key]
+    }
+    $json = $ordered | ConvertTo-Json -Compress
+    $scrambled = Protect-DlnaObfuscationMapText -PlainText $json
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($dir)
+    }
+    [System.IO.File]::WriteAllText($path, $scrambled)
+}
+
+function Get-DlnaContentHashLeaf {
+    param([Parameter(Mandatory = $true)][string] $RelativeClearPath)
+    $norm = (($RelativeClearPath -replace '/', '\').Trim().ToLowerInvariant())
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($norm))
+    } finally {
+        $sha.Dispose()
+    }
+    $hex = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+    return ($hex + $script:DlnaObfuscationTmpSuffix)
+}
+
+function Test-DlnaHashTmpFileName {
+    param([Parameter(Mandatory = $true)][string] $FileName)
+    return [bool]($FileName -match '^[0-9a-fA-F]{16,64}(_v)?\.tmp$')
+}
+
+function Test-DlnaLegacyObfuscatedFileName {
+    param([Parameter(Mandatory = $true)][string] $FileName)
+    if (-not $FileName.StartsWith($script:DlnaObfuscationPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ($FileName.EndsWith($script:DlnaObfuscationSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    return (Test-DlnaMediaFileName -FileName $FileName)
+}
+
+function Test-DlnaObfuscatedFileName {
+    param([Parameter(Mandatory = $true)][string] $FileName)
+    if (Test-DlnaHashTmpFileName -FileName $FileName) { return $true }
+    return (Test-DlnaLegacyObfuscatedFileName -FileName $FileName)
+}
+
+function Get-DlnaLegacyUnobfuscatedLeafName {
+    param([Parameter(Mandatory = $true)][string] $LeafName)
+    if (-not $LeafName.StartsWith($script:DlnaObfuscationPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $LeafName
+    }
+    $mid = $LeafName.Substring($script:DlnaObfuscationPrefix.Length)
+    if ($mid.EndsWith($script:DlnaObfuscationSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $mid.Substring(0, $mid.Length - $script:DlnaObfuscationSuffix.Length)
+    }
+    return $mid
+}
+
+function Test-DlnaLogPath {
+    param([Parameter(Mandatory = $true)][string] $FullPath)
+    if ($FullPath -match '(?i)[\\/]logs[\\/]') { return $true }
+    return ([System.IO.Path]::GetExtension($FullPath) -eq '.log')
+}
+
+function Clear-DlnaPathBestEffort {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [switch] $DryRun
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return 'missing'
+    }
+    if ($DryRun.IsPresent) { return 'dry-run' }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return 'deleted'
+    } catch {
+        try {
+            $fs = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Truncate,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::Read
+            )
+            $fs.Close()
+            $fs.Dispose()
+            return 'truncated'
+        } catch {
+            return 'failed'
+        }
+    }
+}
+
+function Rename-DlnaPathBestEffort {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $DestinationLeaf,
+        [switch] $DryRun
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return 'missing'
+    }
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    $dest = [System.IO.Path]::Combine($dir, $DestinationLeaf)
+    if ($Path.Equals($dest, [StringComparison]::OrdinalIgnoreCase)) {
+        return 'unchanged'
+    }
+    if ($DryRun.IsPresent) { return 'dry-run' }
+    try {
+        if (Test-Path -LiteralPath $dest -PathType Leaf) {
+            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        }
+        Rename-Item -LiteralPath $Path -NewName $DestinationLeaf -Force -ErrorAction Stop
+        return 'renamed'
+    } catch {
+        return 'failed'
+    }
+}
+
+function Restore-DlnaObfuscatedMedia {
+    param(
+        [string] $Root = '',
+        [switch] $DryRun,
+        [switch] $Quiet
+    )
+    $rootFull = $null
+    if (-not [string]::IsNullOrWhiteSpace($Root)) {
+        $rootFull = [System.IO.Path]::GetFullPath($Root)
+    } elseif ($script:DlnaSegmentRootEnsured -and -not [string]::IsNullOrWhiteSpace($script:DlnaSegmentRootDefault)) {
+        $rootFull = $script:DlnaSegmentRootDefault
+    } else {
+        $rootFull = $script:DlnaSegmentRootPreferred
+    }
+
+    $restored = 0
+    $skipped = 0
+    $failed = 0
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        return @{ Root = $rootFull; Restored = 0; Skipped = 0; Failed = 0 }
+    }
+
+    $map = Read-DlnaObfuscationMap -Root $rootFull
+    $mapDirty = $false
+    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -ne $script:DlnaObfuscationMapLeaf -and
+            (Test-DlnaObfuscatedFileName -FileName $_.Name)
+        })
+
+    foreach ($f in $files) {
+        $relObf = Get-DlnaPathRelativeToRoot -Root $rootFull -FullPath $f.FullName
+        $clearRel = $null
+        $clearLeaf = $null
+        $destDir = $f.DirectoryName
+
+        if (Test-DlnaHashTmpFileName -FileName $f.Name) {
+            if ($map.ContainsKey($relObf)) {
+                $clearRel = [string]$map[$relObf]
+            } else {
+                foreach ($k in @($map.Keys)) {
+                    if ([System.IO.Path]::GetFileName([string]$k).Equals($f.Name, [StringComparison]::OrdinalIgnoreCase)) {
+                        $clearRel = [string]$map[$k]
+                        break
+                    }
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($clearRel)) {
+                $skipped++
+                continue
+            }
+            $clearLeaf = [System.IO.Path]::GetFileName($clearRel)
+            $clearParent = [System.IO.Path]::GetDirectoryName($clearRel)
+            if (-not [string]::IsNullOrWhiteSpace($clearParent)) {
+                $destDir = [System.IO.Path]::GetFullPath((Join-Path $rootFull $clearParent))
+                if (-not $DryRun.IsPresent -and -not (Test-Path -LiteralPath $destDir -PathType Container)) {
+                    [void][System.IO.Directory]::CreateDirectory($destDir)
+                }
+            }
+        } else {
+            $clearLeaf = Get-DlnaLegacyUnobfuscatedLeafName -LeafName $f.Name
+            $clearRel = Get-DlnaPathRelativeToRoot -Root $rootFull -FullPath (Join-Path $f.DirectoryName $clearLeaf)
+        }
+
+        if ([string]::IsNullOrWhiteSpace($clearLeaf)) {
+            $skipped++
+            continue
+        }
+
+        $dest = [System.IO.Path]::Combine($destDir, $clearLeaf)
+        if (Test-Path -LiteralPath $dest -PathType Leaf) {
+            $dupAction = Clear-DlnaPathBestEffort -Path $f.FullName -DryRun:$DryRun.IsPresent
+            if ($dupAction -eq 'failed') { $failed++ } else { $skipped++ }
+            if ($map.ContainsKey($relObf)) {
+                $map.Remove($relObf)
+                $mapDirty = $true
+            }
+            continue
+        }
+
+        if ($destDir.Equals($f.DirectoryName, [StringComparison]::OrdinalIgnoreCase)) {
+            $action = Rename-DlnaPathBestEffort -Path $f.FullName -DestinationLeaf $clearLeaf -DryRun:$DryRun.IsPresent
+        } elseif ($DryRun.IsPresent) {
+            $action = 'dry-run'
+        } else {
+            try {
+                Move-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
+                $action = 'renamed'
+            } catch {
+                $action = 'failed'
+            }
+        }
+
+        switch ($action) {
+            { $_ -in @('renamed', 'dry-run') } {
+                $restored++
+                if ($map.ContainsKey($relObf)) {
+                    $map.Remove($relObf)
+                    $mapDirty = $true
+                }
+            }
+            { $_ -in @('unchanged', 'missing') } { $skipped++ }
+            default { $failed++ }
+        }
+    }
+
+    if ($mapDirty -or ($map.Count -eq 0 -and (Test-Path -LiteralPath (Get-DlnaObfuscationMapPath -Root $rootFull)))) {
+        Write-DlnaObfuscationMap -Root $rootFull -Map $map -DryRun:$DryRun.IsPresent
+    }
+
+    if (-not $Quiet.IsPresent -and ($restored -gt 0 -or $failed -gt 0)) {
+        $verb = if ($DryRun.IsPresent) { 'would restore' } else { 'restored' }
+        Write-Host ("DLNA root {0} obfuscated media: {1} (restored={2}, skipped={3}, failed={4})" -f `
+            $verb, $rootFull, $restored, $skipped, $failed)
+    }
+
+    return @{
+        Root     = $rootFull
+        Restored = $restored
+        Skipped  = $skipped
+        Failed   = $failed
+    }
+}
+
+function Obfuscate-DlnaSegmentRootMedia {
+    param(
+        [string] $Root = '',
+        [switch] $DryRun,
+        [switch] $NoStopLeafExport,
+        [switch] $Quiet,
+        [switch] $KeepLogs
+    )
+    $rootFull = $null
+    try {
+        if ([string]::IsNullOrWhiteSpace($Root)) {
+            $rootFull = Ensure-DlnaSegmentRoot
+        } else {
+            $rootFull = [System.IO.Path]::GetFullPath($Root)
+        }
+    } catch {
+        $rootFull = $script:DlnaSegmentRootPreferred
+    }
+
+    $obfuscated = 0
+    $deleted = 0
+    $truncated = 0
+    $failed = 0
+    $stopped = 0
+    $keptLogs = 0
+    $skipped = 0
+
+    if (-not $NoStopLeafExport.IsPresent -and -not $DryRun.IsPresent) {
+        try { $stopped = [int](Stop-LeafFfmpegExport) } catch { $stopped = 0 }
+    }
+
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        if (-not $DryRun.IsPresent) {
+            try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
+        }
+        return @{
+            Root       = $rootFull
+            Obfuscated = 0
+            Deleted    = 0
+            Truncated  = 0
+            Failed     = 0
+            Stopped    = $stopped
+            KeptLogs   = 0
+            Skipped    = 0
+        }
+    }
+
+    $map = Read-DlnaObfuscationMap -Root $rootFull
+    $mapDirty = $false
+    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $script:DlnaObfuscationMapLeaf })
+    foreach ($f in $files) {
+        if (Test-DlnaLogPath -FullPath $f.FullName) {
+            if ($KeepLogs.IsPresent) {
+                $keptLogs++
+                continue
+            }
+            $action = Clear-DlnaPathBestEffort -Path $f.FullName -DryRun:$DryRun.IsPresent
+            switch ($action) {
+                'deleted' { $deleted++ }
+                'truncated' { $truncated++ }
+                'dry-run' { $deleted++ }
+                'failed' { $failed++ }
+            }
+            continue
+        }
+
+        if (Test-DlnaHashTmpFileName -FileName $f.Name) {
+            $skipped++
+            continue
+        }
+
+        $clearLeaf = $f.Name
+        $isLegacy = Test-DlnaLegacyObfuscatedFileName -FileName $f.Name
+        if ($isLegacy) {
+            $clearLeaf = Get-DlnaLegacyUnobfuscatedLeafName -LeafName $f.Name
+        } elseif (-not (Test-DlnaMediaFileName -FileName $f.Name)) {
+            $skipped++
+            continue
+        }
+
+        $clearFullForHash = if ($isLegacy) {
+            [System.IO.Path]::Combine($f.DirectoryName, $clearLeaf)
+        } else {
+            $f.FullName
+        }
+        $clearRel = Get-DlnaPathRelativeToRoot -Root $rootFull -FullPath $clearFullForHash
+        $obfLeaf = Get-DlnaContentHashLeaf -RelativeClearPath $clearRel
+        if ($obfLeaf.Equals($f.Name, [StringComparison]::OrdinalIgnoreCase)) {
+            $skipped++
+            continue
+        }
+
+        $action = Rename-DlnaPathBestEffort -Path $f.FullName -DestinationLeaf $obfLeaf -DryRun:$DryRun.IsPresent
+        switch ($action) {
+            { $_ -in @('renamed', 'dry-run') } {
+                $obfuscated++
+                $relObf = Get-DlnaPathRelativeToRoot -Root $rootFull -FullPath ([System.IO.Path]::Combine($f.DirectoryName, $obfLeaf))
+                $map[$relObf] = $clearRel
+                $mapDirty = $true
+            }
+            { $_ -in @('unchanged', 'missing') } { $skipped++ }
+            default { $failed++ }
+        }
+    }
+
+    if ($mapDirty) {
+        Write-DlnaObfuscationMap -Root $rootFull -Map $map -DryRun:$DryRun.IsPresent
+    }
+
+    if (-not $DryRun.IsPresent) {
+        try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
+    }
+
+    if (-not $Quiet.IsPresent) {
+        $verb = if ($DryRun.IsPresent) { 'would obfuscate' } else { 'obfuscated' }
+        $logNote = if ($KeepLogs.IsPresent) { ", kept_logs=$keptLogs" } else { ", logs_deleted=$deleted, logs_truncated=$truncated" }
+        Write-Host ("DLNA root {0} media: {1} (obfuscated={2}, failed={3}, skipped={4}, stopped_leaf_ffmpeg={5}{6})" -f `
+            $verb, $rootFull, $obfuscated, $failed, $skipped, $stopped, $logNote)
+    }
+
+    return @{
+        Root       = $rootFull
+        Obfuscated = $obfuscated
+        Deleted    = $deleted
+        Truncated  = $truncated
+        Failed     = $failed
+        Stopped    = $stopped
+        KeptLogs   = $keptLogs
+        Skipped    = $skipped
+    }
+}
+
+function Clear-DlnaSegmentRootContents {
+    param(
+        [string] $Root = '',
+        [switch] $DryRun,
+        [switch] $NoStopLeafExport,
+        [switch] $Quiet,
+        [switch] $KeepLogs
+    )
+    $rootFull = $null
+    try {
+        if ([string]::IsNullOrWhiteSpace($Root)) {
+            $rootFull = Ensure-DlnaSegmentRoot
+        } else {
+            $rootFull = [System.IO.Path]::GetFullPath($Root)
+        }
+    } catch {
+        $rootFull = $script:DlnaSegmentRootPreferred
+    }
+
+    $deleted = 0
+    $truncated = 0
+    $failed = 0
+    $stopped = 0
+    $keptLogs = 0
+
+    if (-not $NoStopLeafExport.IsPresent -and -not $DryRun.IsPresent) {
+        try { $stopped = [int](Stop-LeafFfmpegExport) } catch { $stopped = 0 }
+    }
+
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        if (-not $DryRun.IsPresent) {
+            try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
+        }
+        return @{
+            Root      = $rootFull
+            Deleted   = 0
+            Truncated = 0
+            Failed    = 0
+            Stopped   = $stopped
+            KeptLogs  = 0
+        }
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force -ErrorAction SilentlyContinue)
+    foreach ($f in $files) {
+        if ($KeepLogs.IsPresent -and (Test-DlnaLogPath -FullPath $f.FullName)) {
+            $keptLogs++
+            continue
+        }
+        $action = Clear-DlnaPathBestEffort -Path $f.FullName -DryRun:$DryRun.IsPresent
+        switch ($action) {
+            'deleted' { $deleted++ }
+            'truncated' { $truncated++ }
+            'dry-run' { $deleted++ }
+            'failed' { $failed++ }
+        }
+    }
+
+    if (-not $DryRun.IsPresent) {
+        try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
+    }
+
+    if (-not $Quiet.IsPresent) {
+        $verb = if ($DryRun.IsPresent) { 'would clear' } else { 'cleared' }
+        Write-Host ("DLNA root {0} contents: {1} (deleted={2}, truncated={3}, failed={4}, stopped_leaf_ffmpeg={5}, kept_logs={6})" -f `
+            $verb, $rootFull, $deleted, $truncated, $failed, $stopped, $keptLogs)
+    }
+
+    return @{
+        Root      = $rootFull
+        Deleted   = $deleted
+        Truncated = $truncated
+        Failed    = $failed
+        Stopped   = $stopped
+        KeptLogs  = $keptLogs
     }
 }
 

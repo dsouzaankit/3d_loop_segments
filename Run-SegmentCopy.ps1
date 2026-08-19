@@ -11,7 +11,7 @@
   README.md: mapped-network input can bottleneck reads; DLNA idle (default Wi-Fi Mbps heuristic) is experimental.
   Console: Space pauses/resumes the segment remux (3d_op_*.mkv) via NtSuspend/NtResume; Enter stops ffmpeg and exits (130).
   DLNA Wi-Fi idle and run timeout (3600s) keep ticking while Space-paused; idle kill (~305s sample history + five low Mbps windows) is independent of ffmpeg suspend.
-  DLNA root: F:\f1_media\3d_fullsbs_trans is always AppData-backed (%AppData%\3d_loop_segments) with subst F: for the run; Remove-DlnaSegmentRootSubst on exit. A physical F: volume must be free (script does not write there).
+  DLNA root: F:\f1_media\3d_fullsbs_trans is always AppData-backed with subst F: for the run. On quit: Obfuscate-DlnaSegmentRootMedia (rename segments to sha256.tmp + .dlna_obf_map.json), then Remove-DlnaSegmentRootSubst; startup restores via Ensure-DlnaSegmentRoot.
 
 .PARAMETER LiteralPath
   Input file (Explorer passes %L expanded).
@@ -1043,7 +1043,15 @@ DLNA idle monitoring (legacy): after both segment files exist, ffmpeg stops if m
     if ($ownsMutex -and $lockOwnerPath) {
         try { Remove-Item -LiteralPath $lockOwnerPath -Force -ErrorAction SilentlyContinue } catch { }
     }
-    if (Get-Command Remove-DlnaSegmentRootSubst -ErrorAction SilentlyContinue) {
+    if (-not $DryRun -and (Get-Command Invoke-DlnaWorkflowQuitCleanup -ErrorAction SilentlyContinue)) {
+        $keepDlnaLogs = ($exitCode -ne 0 -and $exitCode -ne $script:ExitCodeTimeout -and `
+            $exitCode -ne $script:ExitCodeDlnaIdle -and $exitCode -ne $script:ExitCodeUserCancel)
+        try {
+            [void](Invoke-DlnaWorkflowQuitCleanup -KeepLogs:$keepDlnaLogs)
+        } catch {
+            Write-Warning ("DLNA workflow quit cleanup failed: {0}" -f $_.Exception.Message)
+        }
+    } elseif (Get-Command Remove-DlnaSegmentRootSubst -ErrorAction SilentlyContinue) {
         try {
             [void](Remove-DlnaSegmentRootSubst)
         } catch {

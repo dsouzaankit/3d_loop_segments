@@ -31,6 +31,15 @@ Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1`
 
 On exit, **`Remove-DlnaSegmentRootSubst`** removes our junction and `subst F: /d`. AppData data stays. Subst mount name **`3d_loop_segments_F_subst`** avoids clashing with `3d_playlist_local`.
 
+### Media obfuscation (quit / startup)
+
+Same pattern as `3d_playlist_local`:
+
+- **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` segment files using scrambled **`.dlna_obf_map.json`** in the DLNA root (`3d_op_00.mkv` / `3d_op_01.mkv` names come back).
+- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`): stops leaf ffmpeg, renames media to `<sha256(relativePath)>.tmp`, writes/updates the map, removes `subst F:`. Media is **hidden from DLNA**, not deleted.
+- **Manual delete:** `Cleanup-DlnaSegmentRoot.ps1` (calls `Clear-DlnaSegmentRootContents`).
+- **Keep logs on error:** non-zero exit codes other than timeout (**124**), DLNA idle (**125**), and user cancel (**130**) pass `-KeepLogs` to the obfuscator (rarely needed here; segment logs live under `segmentcopy_logs\` beside the script).
+
 ---
 
 ## Decoder frame skip (`-SkipSourceDecodeFrames`; **deprecated in this script**)
