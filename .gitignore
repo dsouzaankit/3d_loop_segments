@@ -1,0 +1,10 @@
+# Runtime logs
+segmentcopy_logs/
+*.log
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
