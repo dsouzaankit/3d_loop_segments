@@ -21,7 +21,9 @@ If **input files** live on a **mapped drive** (SMB share, VPN, NAS, etc.), **rea
 
 ## DLNA output root (`F:` / `%AppData%`)
 
-Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex:
+Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex.
+
+The letter is **always F:** — not a random free drive. Skybox is configured for that share path; writing `K:\...` (or any other letter) would remux locally while the headset kept reading **F:**. Playlist already subst’s **F:** to the same tree, so this script **reuses** that mapping instead of inventing a second drive.
 
 | F: at start | What happens |
 |-------------|--------------|
