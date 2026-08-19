@@ -29,7 +29,7 @@ Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1`
 | Our subst from a prior run | Refresh junction; reuse mapping. |
 | Physical drive or foreign `subst` | **Error** — free `F:` before running. |
 
-On exit, **`Remove-DlnaSegmentRootSubst`** removes our junction and `subst F: /d`. AppData data stays. Subst mount name **`3d_loop_segments_F_subst`** avoids clashing with `3d_playlist_local`.
+On exit, **`Remove-DlnaSegmentRootSubst`** removes our junction and `subst F: /d`. AppData data stays. Subst mount name **`3d_loop_segments_F_subst`** avoids clashing with `3d_playlist_local`. After `subst`, the script also registers a PowerShell **`F:`** drive (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive F:** and context-menu runs fail).
 
 ### Media obfuscation (quit / startup)
 

@@ -76,6 +76,45 @@ function Get-SubstDriveTarget {
     return $null
 }
 
+function Join-DlnaNetPath {
+    param(
+        [Parameter(Mandatory = $true)][string] $Base,
+        [Parameter(Mandatory = $true)][string] $Child
+    )
+    return [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($Base, $Child))
+}
+
+function Register-DlnaSubstPsDrive {
+    param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
+    $name = $Letter.TrimEnd(':')
+    $mount = Get-DlnaSegmentRootSubstMount
+    $existing = Get-PSDrive -Name $name -PSProvider FileSystem -ErrorAction SilentlyContinue
+    if ($null -ne $existing) { return $true }
+    try {
+        # subst is visible to Win32 but not to this session's FileSystem provider until mapped.
+        New-PSDrive -Name $name -PSProvider FileSystem -Root $mount -Scope Global -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-Warning ("Could not register PowerShell drive {0}: ({1}). Using Win32 paths only." -f $name, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Unregister-DlnaSubstPsDrive {
+    param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
+    $name = $Letter.TrimEnd(':')
+    $drv = Get-PSDrive -Name $name -PSProvider FileSystem -ErrorAction SilentlyContinue
+    if ($null -eq $drv) { return }
+    try {
+        $mount = Get-DlnaSegmentRootSubstMount
+        $root = [string]$drv.Root
+        if (-not $root.TrimEnd('\').Equals($mount.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+    } catch { }
+    try { Remove-PSDrive -Name $name -Force -ErrorAction SilentlyContinue } catch { }
+}
+
 function Ensure-DirectoryJunction {
     param(
         [Parameter(Mandatory = $true)][string] $LinkPath,
@@ -180,7 +219,9 @@ function Ensure-DlnaSegmentRoot {
             $letter, $substMount, $script:DlnaSegmentRootAppDataLeaf, $preferred)
     }
 
-    if (-not (Test-Path -LiteralPath $preferred -PathType Container)) {
+    [void](Register-DlnaSubstPsDrive -Letter $letter)
+
+    if (-not [System.IO.Directory]::Exists($preferred)) {
         throw ("DLNA subst/junction setup succeeded but preferred path missing: {0}" -f $preferred)
     }
 
@@ -244,6 +285,7 @@ function Remove-DlnaSegmentRootSubst {
 
     $substRemoved = $false
     if (-not $DryRun.IsPresent) {
+        Unregister-DlnaSubstPsDrive -Letter $letter
         try {
             & subst.exe "${letter}:" /d 2>&1 | Out-Null
         } catch { }
@@ -345,7 +387,7 @@ function Get-DlnaPathRelativeToRoot {
 
 function Get-DlnaObfuscationMapPath {
     param([Parameter(Mandatory = $true)][string] $Root)
-    return [System.IO.Path]::GetFullPath((Join-Path $Root $script:DlnaObfuscationMapLeaf))
+    return (Join-DlnaNetPath -Base $Root -Child $script:DlnaObfuscationMapLeaf)
 }
 
 function Get-DlnaObfuscationMapKeyBytes {
@@ -569,7 +611,7 @@ function Restore-DlnaObfuscatedMedia {
     $restored = 0
     $skipped = 0
     $failed = 0
-    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+    if (-not [System.IO.Directory]::Exists($rootFull)) {
         return @{ Root = $rootFull; Restored = 0; Skipped = 0; Failed = 0 }
     }
 
@@ -605,7 +647,7 @@ function Restore-DlnaObfuscatedMedia {
             $clearLeaf = [System.IO.Path]::GetFileName($clearRel)
             $clearParent = [System.IO.Path]::GetDirectoryName($clearRel)
             if (-not [string]::IsNullOrWhiteSpace($clearParent)) {
-                $destDir = [System.IO.Path]::GetFullPath((Join-Path $rootFull $clearParent))
+                $destDir = Join-DlnaNetPath -Base $rootFull -Child $clearParent
                 if (-not $DryRun.IsPresent -and -not (Test-Path -LiteralPath $destDir -PathType Container)) {
                     [void][System.IO.Directory]::CreateDirectory($destDir)
                 }
@@ -706,7 +748,7 @@ function Obfuscate-DlnaSegmentRootMedia {
         try { $stopped = [int](Stop-LeafFfmpegExport) } catch { $stopped = 0 }
     }
 
-    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+    if (-not [System.IO.Directory]::Exists($rootFull)) {
         if (-not $DryRun.IsPresent) {
             try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
         }
@@ -837,7 +879,7 @@ function Clear-DlnaSegmentRootContents {
         try { $stopped = [int](Stop-LeafFfmpegExport) } catch { $stopped = 0 }
     }
 
-    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+    if (-not [System.IO.Directory]::Exists($rootFull)) {
         if (-not $DryRun.IsPresent) {
             try { Ensure-DlnaSegmentRootDirectory -Root $rootFull } catch { }
         }

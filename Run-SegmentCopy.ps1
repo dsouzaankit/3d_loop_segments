@@ -708,10 +708,10 @@ try {
     }
 
     $root = [System.IO.Path]::GetFullPath($OutputDirectory)
-    $outPath = Join-Path $root $HardcodedOutputFilePattern
+    $outPath = [System.IO.Path]::Combine($root, $HardcodedOutputFilePattern)
     $outDir = [System.IO.Path]::GetDirectoryName($outPath)
-    if (-not (Test-Path -LiteralPath $outDir)) {
-        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    if (-not [System.IO.Directory]::Exists($outDir)) {
+        [void][System.IO.Directory]::CreateDirectory($outDir)
     }
 
     $ffmpegExe = $Ffmpeg
@@ -1031,6 +1031,9 @@ DLNA idle monitoring (legacy): after both segment files exist, ffmpeg stops if m
             if ($tail) { Write-Host ($tail -join [Environment]::NewLine) }
         } catch { }
     }
+} catch {
+    Write-Warning ("Segment remux failed: {0}" -f $_.Exception.Message)
+    if ($exitCode -eq 0) { $exitCode = 1 }
 } finally {
     if ($transcriptActive) {
         try { Stop-Transcript } catch { }
