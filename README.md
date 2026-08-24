@@ -21,7 +21,7 @@ If **input files** live on a **mapped drive** (SMB share, VPN, NAS, etc.), **rea
 
 ## DLNA output root (`M:` / `%AppData%`)
 
-Skybox/DLNA uses **`{letter}:\m1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex.
+Skybox/DLNA uses **`{letter}:\m1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex. Default `-OutputDirectory` is **`M:\m1_media\3d_fullsbs_trans`**; **`Convert-DlnaPlaceholderSharePath`** retargets legacy **`F:\` / `K:\` / `M:\`** `f1_media` / `k1_media` / `m1_media` placeholders to the live dummy letter.
 
 The preferred letter is **M:**. If **M:** is taken, a free **D–Z** letter is used and the Skybox PC client **Add folders** mapping is updated (or you are warned to add that path). Playlist already subst’s the same **`m1_media_dlna_subst`** mount, so this script **reuses** that mapping instead of inventing a second dummy tree.
 
@@ -31,7 +31,9 @@ The preferred letter is **M:**. If **M:** is taken, a free **D–Z** letter is u
 | Existing AppData subst (including playlist’s `m1_media_dlna_subst`, or leftover `f1_media_F_subst`) | **Reuse** that mapping. Write to `{letter}:\m1_media\3d_fullsbs_trans`. Physical files follow the **existing** `3d_fullsbs_trans` junction (typically `%AppData%\3d_playlist_local`), **not** `%AppData%\3d_loop_segments`. Do not steal or `subst /d` on quit. Drop leftover **`f1_media\`** / **`k1_media\`** parents when empty. Obfuscate recursively, including **`fisheye_temp\`**; skip live playlist segment dirs **`flat\` / `fisheye\` / `hybrid\`** only. |
 | Physical drive or non-AppData `subst` on the preferred letter | Pick a free **D–Z** letter (or error if none). |
 
-On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `{letter}:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell drive for that letter (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive** and context-menu runs fail). Set **`3D_LOOP_SEGMENTS_SKIP_SKYBOX=1`** to skip launching Skybox (mappings still sync if it is already up).
+On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `{letter}:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell drive for that letter (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive** and context-menu runs fail). Set **`3D_LOOP_SEGMENTS_SKIP_SKYBOX=1`** (or **`3D_PLAYLIST_SKIP_SKYBOX=1`**) to skip launching Skybox (mappings still sync if it is already up). Log/manual cleanup (`Cleanup-DlnaSegmentRoot.ps1`, obfuscate/clear helpers) calls **`Ensure-DlnaSegmentRoot -SkipSkyboxClient`**.
+
+Skybox start/stop and AirScreen mapping come from **`Get-LoopSegmentsSkybox.ps1`**, which **dot-sources** `SkyboxVrPc.UnmapPath.ps1`. This repo does **not** vendor `Skybox_vr_pc` as a git submodule (unlike `3d_playlist_local`). It loads the first existing tree among **`SKYBOX_VR_PC_ROOT`**, **`P:\all_scripts\Skybox_vr_pc`**, and a **`Skybox_vr_pc`** folder found by walking up from this script.
 
 ### Media obfuscation (quit / startup)
 
