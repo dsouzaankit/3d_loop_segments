@@ -13,32 +13,32 @@ If **input files** live on a **mapped drive** (SMB share, VPN, NAS, etc.), **rea
   2. Use **wired LAN** and a path that can sustain the **source file’s** peak read rate (not just “average internet speed”).
   3. Reduce competing traffic on the same link while ffmpeg is running.
 
-**Output** uses the Skybox DLNA path **`F:\f1_media\3d_fullsbs_trans`**. Dummy **`subst F:`** uses **`%AppData%\f1_media_F_subst`** (same as `3d_playlist_local`). If that subst is already active, this script **reuses** it. A **physical F: drive** (or a subst not under `%AppData%`) is an error. On exit, **`subst F: /d`** only if **this run** created the mapping.
+**Output** uses the Skybox DLNA path **`M:\m1_media\3d_fullsbs_trans`** (prefer **M:**; a free **D–Z** letter if **M:** is a real volume or someone else’s subst). Dummy subst uses **`%AppData%\m1_media_dlna_subst`** (same as `3d_playlist_local`; leftover **`f1_media_F_subst`** is renamed). If that subst is already active, this script **reuses** it. A **physical** preferred letter (or a subst not under `%AppData%`) is an error or triggers a fallback letter. On exit, **`subst {letter}: /d`** only if **this run** created the mapping. Leftover dummy parent **`f1_media\`** (and **`k1_media\`**) under the subst mount is removed when empty.
 
 **Downstream streaming** (e.g. DLNA to a client over a link slower than your media bitrate) is a **separate** bottleneck from “reading the source over SMB.”
 
 ---
 
-## DLNA output root (`F:` / `%AppData%`)
+## DLNA output root (`M:` / `%AppData%`)
 
-Skybox/DLNA still uses **`F:\f1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex.
+Skybox/DLNA uses **`{letter}:\m1_media\3d_fullsbs_trans`**. `Run-SegmentCopy.ps1` always calls **`Ensure-DlnaSegmentRoot`** after the instance mutex.
 
-The letter is **always F:** — not a random free drive. Skybox is configured for that share path; writing `K:\...` (or any other letter) would remux locally while the headset kept reading **F:**. Playlist already subst’s **F:** to the same tree, so this script **reuses** that mapping instead of inventing a second drive.
+The preferred letter is **M:**. If **M:** is taken, a free **D–Z** letter is used and the Skybox PC client **Add folders** mapping is updated (or you are warned to add that path). Playlist already subst’s the same **`m1_media_dlna_subst`** mount, so this script **reuses** that mapping instead of inventing a second dummy tree.
 
-| F: at start | What happens |
-|-------------|--------------|
-| Absent (unmapped) | This run **creates** `subst F:` → `%AppData%\f1_media_F_subst` (same mount as `3d_playlist_local`); junction → `%AppData%\3d_loop_segments` if that path is not already a folder/junction. On quit: full-tree obfuscate, then **`subst F: /d`**. |
-| Existing AppData subst (including playlist’s `f1_media_F_subst`) | **Reuse** that mapping. Write to `F:\f1_media\3d_fullsbs_trans`. Physical files follow the **existing** `3d_fullsbs_trans` junction (typically `%AppData%\3d_playlist_local`), **not** `%AppData%\3d_loop_segments`. Do not steal or `subst /d` on quit. Obfuscate recursively, including **`fisheye_temp\`**; skip live playlist segment dirs **`flat\` / `fisheye\` / `hybrid\`** only. |
-| Physical drive or non-AppData `subst` | **Error** — free `F:` before running. |
+| Dummy letter at start | What happens |
+|-----------------------|--------------|
+| Absent (unmapped) | This run **creates** `subst {letter}:` → `%AppData%\m1_media_dlna_subst`; junction → `%AppData%\3d_loop_segments` if that path is not already a folder/junction. Starts Skybox PC client if idle and maps **3d_fullsbs_trans**. On quit: unmap that Skybox folder, obfuscate, then **`subst /d`** if this run created the mapping. |
+| Existing AppData subst (including playlist’s `m1_media_dlna_subst`, or leftover `f1_media_F_subst`) | **Reuse** that mapping. Write to `{letter}:\m1_media\3d_fullsbs_trans`. Physical files follow the **existing** `3d_fullsbs_trans` junction (typically `%AppData%\3d_playlist_local`), **not** `%AppData%\3d_loop_segments`. Do not steal or `subst /d` on quit. Drop leftover **`f1_media\`** / **`k1_media\`** parents when empty. Obfuscate recursively, including **`fisheye_temp\`**; skip live playlist segment dirs **`flat\` / `fisheye\` / `hybrid\`** only. |
+| Physical drive or non-AppData `subst` on the preferred letter | Pick a free **D–Z** letter (or error if none). |
 
-On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `F:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell **`F:`** drive (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive F:** and context-menu runs fail).
+On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `{letter}:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell drive for that letter (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive** and context-menu runs fail). Set **`3D_LOOP_SEGMENTS_SKIP_SKYBOX=1`** to skip launching Skybox (mappings still sync if it is already up).
 
 ### Media obfuscation (quit / startup)
 
 Same pattern as `3d_playlist_local`:
 
 - **Startup** (`Ensure-DlnaSegmentRoot`): restores any `<sha256>.tmp` files using this script’s scrambled **`.dlna_obf_map.3d_loop_segments.json`** (`3d_op_00.mkv` / `3d_op_01.mkv` and any `.avs` / `.avsi` names come back). If the clear name already exists, the restored file **overwrites** it so ffmpeg can then `-y` replace in place instead of creating a second file. Does not use playlist’s `.dlna_obf_map.json` (different key; playlist deletes that file when decrypt fails).
-- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`, plus a **Ctrl+C** `trap`): stops leaf ffmpeg, renames media **and AviSynth scripts** (`.avs` / `.avsi`) to `<sha256(relativePath)>.tmp`, writes **`.dlna_obf_map.3d_loop_segments.json`** — including **`fisheye_temp\`**. **`subst F: /d`** only if **this run created** the dummy drive. If playlist already had `F:` subst’d, the mapping stays; live **`flat\` / `fisheye\` / `hybrid\`** segment dirs are not renamed.
+- **Quit** (`Invoke-DlnaWorkflowQuitCleanup` in `Run-SegmentCopy.ps1` `finally`, plus a **Ctrl+C** `trap`): unmaps Skybox **3d_fullsbs_trans** (and quits Skybox only if this run started it), stops leaf ffmpeg, renames media **and AviSynth scripts** (`.avs` / `.avsi`) to `<sha256(relativePath)>.tmp`, writes **`.dlna_obf_map.3d_loop_segments.json`** — including **`fisheye_temp\`**. **`subst {letter}: /d`** only if **this run created** the dummy drive. If playlist already had the dummy letter subst’d, the mapping stays; live **`flat\` / `fisheye\` / `hybrid\`** segment dirs are not renamed.
 - **Manual delete:** `Cleanup-DlnaSegmentRoot.ps1` (calls `Clear-DlnaSegmentRootContents`).
 - **Keep logs on error:** non-zero exit codes other than timeout (**124**), DLNA idle (**125**), and user cancel (**130**) pass `-KeepLogs` to the obfuscator (rarely needed here; segment logs live under `segmentcopy_logs\` beside the script).
 

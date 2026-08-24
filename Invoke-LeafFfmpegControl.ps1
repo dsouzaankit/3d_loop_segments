@@ -5,13 +5,18 @@ $script:LeafFfmpegExportSuspended = $false
 $script:LeafFfmpegSuspendedPids = [System.Collections.Generic.List[int]]::new()
 # Segment mux passes the ffmpeg pattern (3d_op_%02d.mkv), not literal slot filenames.
 $script:LeafFfmpegOutputLeaves = @('3d_op_00.mkv', '3d_op_01.mkv', '3d_op_%02d.mkv')
-# Preferred Skybox DLNA share path. Files live under %AppData%; dummy F: via subst (same mount as 3d_playlist_local).
-$script:DlnaSegmentRootPreferred = 'F:\f1_media\3d_fullsbs_trans'
+# Preferred Skybox DLNA share path (dummy subst, AppData store; same mount as 3d_playlist_local).
+# Prefer M:; if M: is a real volume or someone else's subst, pick a free D-Z letter
+# and warn to remap the folder in the Skybox PC client.
+$script:DlnaSegmentRootShareParent = 'm1_media'
+$script:DlnaSegmentRootShareParentLegacyNames = @('f1_media', 'k1_media')
+$script:DlnaSegmentRootShareRelative = 'm1_media\3d_fullsbs_trans'
+$script:DlnaSegmentRootDriveLetter = 'M'
+$script:DlnaSegmentRootPreferred = ('{0}:\{1}' -f $script:DlnaSegmentRootDriveLetter, $script:DlnaSegmentRootShareRelative)
 $script:DlnaSegmentRootDefault = $script:DlnaSegmentRootPreferred
-$script:DlnaSegmentRootDriveLetter = 'F'
 $script:DlnaSegmentRootAppDataLeaf = '3d_loop_segments'
-# Must match 3d_playlist_local so both workflows can share one subst F: -> Skybox path.
-$script:DlnaSegmentRootSubstLeaf = 'f1_media_F_subst'
+$script:DlnaSegmentRootSubstLeaf = 'm1_media_dlna_subst'
+$script:DlnaSegmentRootSubstLeafLegacyNames = @('k1_media_dlna_subst', 'f1_media_dlna_subst', 'f1_media_F_subst')
 $script:DlnaSegmentRootEnsured = $false
 $script:DlnaSegmentRootEnsureMode = ''
 $script:DlnaSegmentRootOwnedSubst = $false
@@ -47,9 +52,21 @@ function Get-DlnaSegmentRootSubstMount {
     $appData = [Environment]::GetFolderPath('ApplicationData')
     if ([string]::IsNullOrWhiteSpace($appData)) { $appData = $env:APPDATA }
     if ([string]::IsNullOrWhiteSpace($appData)) {
-        throw 'APPDATA is not set; cannot resolve F: subst mount.'
+        throw 'APPDATA is not set; cannot resolve dummy DLNA subst mount.'
     }
-    return [System.IO.Path]::GetFullPath((Join-Path $appData $script:DlnaSegmentRootSubstLeaf))
+    $canonical = [System.IO.Path]::GetFullPath((Join-Path $appData $script:DlnaSegmentRootSubstLeaf))
+    foreach ($legacyLeaf in @($script:DlnaSegmentRootSubstLeafLegacyNames)) {
+        $legacy = [System.IO.Path]::GetFullPath((Join-Path $appData $legacyLeaf))
+        if ((Test-Path -LiteralPath $legacy -PathType Container) -and
+            -not (Test-Path -LiteralPath $canonical -PathType Container)) {
+            try {
+                Move-Item -LiteralPath $legacy -Destination $canonical -Force -ErrorAction Stop
+            } catch {
+                return $legacy
+            }
+        }
+    }
+    return $canonical
 }
 
 function Test-DlnaSegmentRootDrivePresent {
@@ -62,26 +79,120 @@ function Test-DlnaSegmentRootDrivePresent {
     }
 }
 
-function Get-SubstDriveTarget {
-    param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
-    $want = ($Letter.TrimEnd(':') + ':').ToUpperInvariant()
+function Get-SubstDriveMappings {
+    $map = @{}
     $lines = @()
     try {
         $lines = @(& subst.exe 2>$null)
     } catch {
-        return $null
+        return $map
     }
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        # subst lines look like: F:\: => C:\Users\...\3d_loop_segments_F_subst
+        # subst lines look like: M:\: => C:\Users\...\m1_media_dlna_subst
         if ($line -match '^\s*([A-Za-z]:)\\:\s*=>\s*(.+?)\s*$') {
             $mapped = $Matches[1].ToUpperInvariant()
-            if ($mapped -eq $want) {
-                return [System.IO.Path]::GetFullPath($Matches[2].Trim().Trim('"'))
-            }
+            $target = [System.IO.Path]::GetFullPath($Matches[2].Trim().Trim('"'))
+            $map[$mapped.Substring(0, 1)] = $target
         }
     }
+    return $map
+}
+
+function Get-SubstDriveTarget {
+    param([string] $Letter = $script:DlnaSegmentRootDriveLetter)
+    $want = $Letter.TrimEnd(':').ToUpperInvariant().Substring(0, 1)
+    $map = Get-SubstDriveMappings
+    if ($map.ContainsKey($want)) {
+        return $map[$want]
+    }
     return $null
+}
+
+function Set-DlnaSegmentRootActiveLetter {
+    param([Parameter(Mandatory = $true)][string] $Letter)
+    $ch = $Letter.TrimEnd(':').ToUpperInvariant().Substring(0, 1)
+    $script:DlnaSegmentRootDriveLetter = $ch
+    $script:DlnaSegmentRootPreferred = ('{0}:\{1}' -f $ch, $script:DlnaSegmentRootShareRelative)
+}
+
+function Get-DlnaFreeDriveLetters {
+    $occupied = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+        if ($d.Name.Length -ge 1) {
+            [void]$occupied.Add($d.Name.Substring(0, 1))
+        }
+    }
+    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+        $n = [string]$_.Name
+        if ($n.Length -eq 1) { [void]$occupied.Add($n) }
+    }
+    foreach ($letter in (Get-SubstDriveMappings).Keys) {
+        [void]$occupied.Add($letter)
+    }
+    $free = [System.Collections.Generic.List[string]]::new()
+    foreach ($code in 68..90) {
+        $ch = [string][char]$code
+        if (-not $occupied.Contains($ch) -and -not [System.IO.Directory]::Exists("${ch}:\")) {
+            $free.Add($ch)
+        }
+    }
+    return @($free)
+}
+
+function Write-DlnaSkyboxDriveConflictWarning {
+    param(
+        [Parameter(Mandatory = $true)][string] $PreferredLetter,
+        [Parameter(Mandatory = $true)][string] $ActualLetter
+    )
+    $preferred = $PreferredLetter.TrimEnd(':').ToUpperInvariant().Substring(0, 1)
+    $actual = $ActualLetter.TrimEnd(':').ToUpperInvariant().Substring(0, 1)
+    $actualPath = ('{0}:\{1}' -f $actual, $script:DlnaSegmentRootShareRelative)
+    Write-Warning ("Drive {0}: is in use. Dummy DLNA is {1} for this run." -f $preferred, $actualPath)
+    Write-Warning ("If Skybox is running, the workflow will try to update Add folders to {0}. Otherwise add that path yourself." -f $actualPath)
+}
+
+$loopSegmentsSkybox = Join-Path $PSScriptRoot 'Get-LoopSegmentsSkybox.ps1'
+if (-not (Test-Path -LiteralPath $loopSegmentsSkybox -PathType Leaf)) {
+    throw ("Get-LoopSegmentsSkybox.ps1 not found: {0}" -f $loopSegmentsSkybox)
+}
+. $loopSegmentsSkybox
+
+function Resolve-DlnaSegmentRootDriveLetter {
+    param([Parameter(Mandatory = $true)][string] $SubstMount)
+    $preferred = $script:DlnaSegmentRootDriveLetter.TrimEnd(':').ToUpperInvariant().Substring(0, 1)
+    $mappings = Get-SubstDriveMappings
+    $ourLetter = $null
+    foreach ($letter in $mappings.Keys) {
+        if ($mappings[$letter].Equals($SubstMount, [StringComparison]::OrdinalIgnoreCase)) {
+            $ourLetter = $letter
+            break
+        }
+    }
+    $preferredTaken = $mappings.ContainsKey($preferred) -or (Test-DlnaSegmentRootDrivePresent -Letter $preferred)
+    if (-not [string]::IsNullOrWhiteSpace($ourLetter)) {
+        if ($ourLetter -eq $preferred) {
+            return $preferred
+        }
+        if (-not $preferredTaken) {
+            try { & subst.exe "${ourLetter}:" /d 2>&1 | Out-Null } catch { }
+            Write-Host ("DLNA root: moved dummy subst {0}: -> preferred {1}:." -f $ourLetter, $preferred)
+            return $preferred
+        }
+        Write-DlnaSkyboxDriveConflictWarning -PreferredLetter $preferred -ActualLetter $ourLetter
+        return $ourLetter
+    }
+    if (-not $preferredTaken) {
+        return $preferred
+    }
+    $free = @(Get-DlnaFreeDriveLetters)
+    if ($free.Count -eq 0) {
+        throw ("Drive {0}: is in use and no free D-Z letter is left for dummy DLNA subst -> {1}." -f `
+            $preferred, $SubstMount)
+    }
+    $picked = [string]($free | Get-Random)
+    Write-DlnaSkyboxDriveConflictWarning -PreferredLetter $preferred -ActualLetter $picked
+    return $picked
 }
 
 function Join-DlnaNetPath {
@@ -152,6 +263,44 @@ function Ensure-DirectoryJunction {
     return $linkFull
 }
 
+function Remove-DlnaSegmentRootLegacyShareParents {
+    <#
+      After dummy letter moved F: / K: -> M:, subst mount was renamed to m1_media_dlna_subst
+      but leftover f1_media\ / k1_media\ (+ old 3d_fullsbs_trans junction) can remain inside it.
+      Media stay in %AppData%\3d_loop_segments (or the existing junction target); this only drops unused dummy parents.
+    #>
+    param([Parameter(Mandatory = $true)][string] $SubstMount)
+    $mount = [System.IO.Path]::GetFullPath($SubstMount)
+    foreach ($legacyParent in @($script:DlnaSegmentRootShareParentLegacyNames)) {
+        if ([string]::Equals($legacyParent, $script:DlnaSegmentRootShareParent, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $legacyDir = Join-Path $mount $legacyParent
+        if (-not (Test-Path -LiteralPath $legacyDir)) { continue }
+        $legacyJunction = Join-Path $legacyDir '3d_fullsbs_trans'
+        if (Test-Path -LiteralPath $legacyJunction) {
+            try {
+                $item = Get-Item -LiteralPath $legacyJunction -Force
+                $isReparse = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+                if ($isReparse) {
+                    cmd.exe /c rmdir "$legacyJunction" | Out-Null
+                }
+            } catch { }
+        }
+        try {
+            $left = @(Get-ChildItem -LiteralPath $legacyDir -Force -ErrorAction SilentlyContinue)
+            if ($left.Count -eq 0) {
+                Remove-Item -LiteralPath $legacyDir -Force -ErrorAction Stop
+                Write-Host ("DLNA root: removed leftover dummy parent {0}" -f $legacyDir)
+            } else {
+                Write-Warning ("DLNA root: leftover dummy parent still has files, left in place: {0}" -f $legacyDir)
+            }
+        } catch {
+            Write-Warning ("DLNA root: could not remove leftover dummy parent {0}: {1}" -f $legacyDir, $_.Exception.Message)
+        }
+    }
+}
+
 function Complete-DlnaSegmentRootEnsure {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -189,74 +338,151 @@ function Test-DlnaSubstTargetIsShareable {
 function Ensure-DlnaSegmentRoot {
     <#
     .SYNOPSIS
-      Skybox path F:\f1_media\3d_fullsbs_trans via subst F: (same mount as 3d_playlist_local).
-      Reuses an existing AppData subst of F: instead of failing. Does not use a physical F: volume.
+      Skybox path {letter}:\m1_media\3d_fullsbs_trans via dummy subst (prefer M:, same mount as 3d_playlist_local).
+      Reuses an existing AppData subst instead of failing. Does not write onto a real M: volume.
+      Starts the Skybox PC client if idle and maps 3d_fullsbs_trans. Log/manual cleanup passes -SkipSkyboxClient.
     #>
-    param([switch] $Force)
+    param(
+        [switch] $Force,
+        [switch] $SkipSkyboxClient
+    )
     if ($script:DlnaSegmentRootEnsured -and -not $Force.IsPresent) {
         return $script:DlnaSegmentRootDefault
     }
 
-    $preferred = $script:DlnaSegmentRootPreferred
     $appDataRoot = Get-DlnaSegmentRootAppDataFallback
     $substMount = Get-DlnaSegmentRootSubstMount
-    $letter = $script:DlnaSegmentRootDriveLetter
+    $wasOwned = $script:DlnaSegmentRootOwnedSubst
+    $letter = Resolve-DlnaSegmentRootDriveLetter -SubstMount $substMount
+    Set-DlnaSegmentRootActiveLetter -Letter $letter
+    $preferred = $script:DlnaSegmentRootPreferred
     $script:DlnaSegmentRootOwnedSubst = $false
     $script:DlnaSegmentRootSharedSubst = $false
 
     [void][System.IO.Directory]::CreateDirectory($appDataRoot)
 
     $existingSubst = Get-SubstDriveTarget -Letter $letter
+    $mountForShare = $substMount
     if (-not [string]::IsNullOrWhiteSpace($existingSubst)) {
-        if (-not (Test-DlnaSubstTargetIsShareable -SubstTarget $existingSubst)) {
+        if ($existingSubst.Equals($substMount, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($wasOwned) {
+                $script:DlnaSegmentRootOwnedSubst = $true
+            } else {
+                $script:DlnaSegmentRootSharedSubst = $true
+            }
+        } elseif (Test-DlnaSubstTargetIsShareable -SubstTarget $existingSubst) {
+            $script:DlnaSegmentRootSharedSubst = $true
+            $mountForShare = $existingSubst
+        } else {
             throw ("Drive {0}: is subst'd to {1} (not under %AppData%); cannot share it for DLNA." -f `
                 $letter, $existingSubst)
         }
-        $script:DlnaSegmentRootSharedSubst = $true
-        [void][System.IO.Directory]::CreateDirectory((Join-Path $existingSubst 'f1_media'))
-        $junc = Join-Path $existingSubst 'f1_media\3d_fullsbs_trans'
-        if (-not (Test-Path -LiteralPath $junc)) {
-            [void](Ensure-DirectoryJunction -LinkPath $junc -TargetPath $appDataRoot)
-        }
-        [void](Register-DlnaSubstPsDrive -Letter $letter -MountPath $existingSubst)
-        if (-not [System.IO.Directory]::Exists($preferred)) {
-            throw ("Existing {0}: subst ({1}) does not provide Skybox path {2}." -f $letter, $existingSubst, $preferred)
-        }
-        $mode = if ($script:DlnaSegmentRootSharedSubst) { 'shared-subst' } else { 'appdata-subst' }
         Write-Host ("DLNA root: reusing subst {0}: -> {1} (mode={2}); Skybox path {3}." -f `
-            $letter, $existingSubst, $mode, $preferred)
-        return (Complete-DlnaSegmentRootEnsure -Root $preferred -Mode $mode)
+            $letter, $existingSubst, $(if ($script:DlnaSegmentRootSharedSubst) { 'shared-subst' } else { 'appdata-subst' }), $preferred)
+    } elseif (Test-DlnaSegmentRootDrivePresent -Letter $letter) {
+        throw ("Drive {0}: is a real volume (not our dummy subst). Unmount it so Explorer can keep dummy {0}: -> {1}." -f `
+            $letter, $substMount)
+    } else {
+        $substOut = & subst.exe "${letter}:" "$substMount" 2>&1
+        if (-not (Test-DlnaSegmentRootDrivePresent -Letter $letter)) {
+            throw ("Failed to subst dummy {0}: -> {1}: {2}" -f $letter, $substMount, $substOut)
+        }
+        $script:DlnaSegmentRootOwnedSubst = $true
+        Write-Host ("DLNA root: dummy {0}: subst -> {1} (store %AppData%\{2}; Skybox path {3})." -f `
+            $letter, $substMount, $script:DlnaSegmentRootAppDataLeaf, $preferred)
     }
 
-    if (Test-DlnaSegmentRootDrivePresent -Letter $letter) {
-        throw ("Drive {0}: is present but is not an AppData subst. Remove or unmount {0}: so this script can subst it for DLNA output." -f $letter)
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $mountForShare $script:DlnaSegmentRootShareParent))
+    $junc = Join-Path $mountForShare $script:DlnaSegmentRootShareRelative
+    if (-not (Test-Path -LiteralPath $junc)) {
+        [void](Ensure-DirectoryJunction -LinkPath $junc -TargetPath $appDataRoot)
     }
+    Remove-DlnaSegmentRootLegacyShareParents -SubstMount $mountForShare
+    $appDataForLegacy = [Environment]::GetFolderPath('ApplicationData')
+    if ([string]::IsNullOrWhiteSpace($appDataForLegacy)) { $appDataForLegacy = $env:APPDATA }
+    if (-not [string]::IsNullOrWhiteSpace($appDataForLegacy)) {
+        $liveSubstTargets = @((Get-SubstDriveMappings).Values)
+        foreach ($legacyLeaf in @($script:DlnaSegmentRootSubstLeafLegacyNames)) {
+            $legacyMount = [System.IO.Path]::GetFullPath((Join-Path $appDataForLegacy $legacyLeaf))
+            if (-not (Test-Path -LiteralPath $legacyMount -PathType Container)) { continue }
+            if ($legacyMount.Equals($mountForShare, [StringComparison]::OrdinalIgnoreCase) -or
+                $legacyMount.Equals($substMount, [StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            Remove-DlnaSegmentRootLegacyShareParents -SubstMount $legacyMount
+            $inUse = $false
+            foreach ($tgt in $liveSubstTargets) {
+                if ($legacyMount.Equals([string]$tgt, [StringComparison]::OrdinalIgnoreCase)) { $inUse = $true; break }
+            }
+            if ($inUse) { continue }
+            try {
+                $left = @(Get-ChildItem -LiteralPath $legacyMount -Force -ErrorAction SilentlyContinue)
+                if ($left.Count -eq 0) {
+                    Remove-Item -LiteralPath $legacyMount -Force -ErrorAction Stop
+                    Write-Host ("DLNA root: removed leftover dummy subst folder {0}" -f $legacyMount)
+                }
+            } catch { }
+        }
+    }
+    [void](Register-DlnaSubstPsDrive -Letter $letter -MountPath $mountForShare)
 
-    [void][System.IO.Directory]::CreateDirectory((Join-Path $substMount 'f1_media'))
-    [void](Ensure-DirectoryJunction -LinkPath (Join-Path $substMount 'f1_media\3d_fullsbs_trans') -TargetPath $appDataRoot)
-    $substOut = & subst.exe "${letter}:" "$substMount" 2>&1
-    if (-not (Test-DlnaSegmentRootDrivePresent -Letter $letter)) {
-        throw ("Failed to subst {0}: -> {1}: {2}" -f $letter, $substMount, $substOut)
-    }
-    $script:DlnaSegmentRootOwnedSubst = $true
-    [void](Register-DlnaSubstPsDrive -Letter $letter -MountPath $substMount)
     if (-not [System.IO.Directory]::Exists($preferred)) {
-        throw ("DLNA subst/junction setup succeeded but preferred path missing: {0}" -f $preferred)
+        throw ("Dummy subst is mapped but preferred Skybox path is missing: {0}" -f $preferred)
     }
-    Write-Host ("DLNA root: subst {0}: -> {1}; data under %AppData%\{2}; Skybox path {3}." -f `
-        $letter, $substMount, $script:DlnaSegmentRootAppDataLeaf, $preferred)
-    return (Complete-DlnaSegmentRootEnsure -Root $preferred -Mode 'appdata-subst')
+
+    if (-not $SkipSkyboxClient.IsPresent) {
+        try {
+            [void](Start-SkyboxPcClientIfNeeded)
+        } catch {
+            Write-Warning ("Skybox PC client start failed: {0}" -f $_.Exception.Message)
+        }
+        try {
+            Sync-SkyboxDlnaShareMapping -ExpectedRoot $preferred
+        } catch {
+            Write-Warning ("Skybox PC client folder-mapping check failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    $mode = if ($script:DlnaSegmentRootSharedSubst) { 'shared-subst' } else { 'appdata-subst' }
+    return (Complete-DlnaSegmentRootEnsure -Root $preferred -Mode $mode)
 }
 
 function Get-DlnaSegmentRoot {
     return (Ensure-DlnaSegmentRoot)
 }
 
+function Test-DlnaPlaceholderSharePath {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return [bool]($Path.Trim() -match '^[A-Za-z]:\\(?:m1_media|k1_media|f1_media)\\3d_fullsbs_trans(?:\\|$)')
+}
+
+function Convert-DlnaPlaceholderSharePath {
+    <#
+    .SYNOPSIS
+      Retarget F:\ / K:\ / M:\ (or any letter) ...\m1_media\3d_fullsbs_trans\... (also legacy k1_media / f1_media)
+      to the ensured dummy letter. Custom paths are left alone.
+    #>
+    param([string] $Path)
+    if (-not (Test-DlnaPlaceholderSharePath -Path $Path)) {
+        return $Path
+    }
+    $ensured = Ensure-DlnaSegmentRoot
+    if ($Path -match '(?i)[A-Za-z]:\\(?:m1_media|k1_media|f1_media)\\3d_fullsbs_trans(?:\\(.*))?$') {
+        $rest = $Matches[1]
+        if ([string]::IsNullOrWhiteSpace($rest)) {
+            return $ensured
+        }
+        return [System.IO.Path]::GetFullPath((Join-Path $ensured $rest))
+    }
+    return $ensured
+}
+
 function Remove-DlnaSegmentRootSubst {
     <#
     .SYNOPSIS
-      If F: is our AppData subst, remove the 3d_fullsbs_trans junction and subst F: /d.
-      Does not delete %AppData%\3d_loop_segments data.
+      If the session dummy letter is our AppData subst and this run created it, remove the
+      3d_fullsbs_trans junction and subst {letter}: /d. Shared playlist subst is left mapped.
     #>
     param(
         [switch] $Quiet,
@@ -293,7 +519,7 @@ function Remove-DlnaSegmentRootSubst {
         return @{ Removed = $false; Reason = 'shared-subst'; Target = $substTarget }
     }
 
-    $junction = [System.IO.Path]::GetFullPath((Join-Path $substMount 'f1_media\3d_fullsbs_trans'))
+    $junction = [System.IO.Path]::GetFullPath((Join-Path $substMount $script:DlnaSegmentRootShareRelative))
     $junctionRemoved = $false
     if (Test-Path -LiteralPath $junction) {
         try {
@@ -343,7 +569,8 @@ function Remove-DlnaSegmentRootSubst {
 function Invoke-DlnaWorkflowQuitCleanup {
     <#
     .SYNOPSIS
-      Idempotent workflow quit: obfuscate media under DLNA root, then remove dummy F: subst.
+      Idempotent workflow quit: unmap Skybox 3d_fullsbs_trans, quit Skybox only if this run started it,
+      obfuscate media, then remove dummy subst if this run created it.
     #>
     param(
         [switch] $KeepLogs,
@@ -359,6 +586,18 @@ function Invoke-DlnaWorkflowQuitCleanup {
 
     $obf = $null
     $subst = $null
+    if (-not $DryRun.IsPresent) {
+        try {
+            Sync-SkyboxDlnaShareMapping -ExpectedRoot $script:DlnaSegmentRootPreferred -Removed
+        } catch {
+            Write-Warning ("Skybox PC client mapping cleanup on quit failed: {0}" -f $_.Exception.Message)
+        }
+        try {
+            Stop-SkyboxPcClient -OnlyIfWorkflowStarted
+        } catch {
+            Write-Warning ("Skybox PC client quit failed: {0}" -f $_.Exception.Message)
+        }
+    }
     try {
         if (Get-Command Obfuscate-DlnaSegmentRootMedia -ErrorAction SilentlyContinue) {
             $obf = Obfuscate-DlnaSegmentRootMedia -KeepLogs:$KeepLogs.IsPresent -Quiet:$Quiet.IsPresent -DryRun:$DryRun.IsPresent
@@ -371,7 +610,7 @@ function Invoke-DlnaWorkflowQuitCleanup {
             $subst = Remove-DlnaSegmentRootSubst -Quiet:$Quiet.IsPresent -DryRun:$DryRun.IsPresent
         }
     } catch {
-        Write-Warning ("DLNA root F: subst cleanup on quit failed: {0}" -f $_.Exception.Message)
+        Write-Warning ("DLNA root dummy subst cleanup on quit failed: {0}" -f $_.Exception.Message)
     }
     return @{ Done = $true; Skipped = $false; Obfuscate = $obf; Subst = $subst }
 }
@@ -860,7 +1099,7 @@ function Obfuscate-DlnaSegmentRootMedia {
     $rootFull = $null
     try {
         if ([string]::IsNullOrWhiteSpace($Root)) {
-            $rootFull = Ensure-DlnaSegmentRoot
+            $rootFull = Ensure-DlnaSegmentRoot -SkipSkyboxClient
         } else {
             $rootFull = [System.IO.Path]::GetFullPath($Root)
         }
@@ -992,7 +1231,7 @@ function Clear-DlnaSegmentRootContents {
     $rootFull = $null
     try {
         if ([string]::IsNullOrWhiteSpace($Root)) {
-            $rootFull = Ensure-DlnaSegmentRoot
+            $rootFull = Ensure-DlnaSegmentRoot -SkipSkyboxClient
         } else {
             $rootFull = [System.IO.Path]::GetFullPath($Root)
         }

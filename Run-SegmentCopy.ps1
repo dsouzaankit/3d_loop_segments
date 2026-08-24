@@ -3,15 +3,15 @@
 .SYNOPSIS
   Remux input into two rotating segment MKVs (`3d_op_%02d.mkv`) using **stream copy** (`-c copy`) and **realtime read** (`-re`). PotPlayer RememberFiles `-ss` seek is preserved. Encode/decode tuning parameters (**TargetMbps**, **EncoderPreset**, **OutputLongEdgeCapPx**, **SkipSourceDecodeFrames**, **InputReadrate**) are **deprecated and ignored** (kept for Explorer command-line compatibility).
   Optional DLNA idle stop: -DlnaIdleStopMinutes or -DlnaIdleStopSeconds (> 0) enables monitoring (use **0** to disable). Default: **Wi-Fi only** outbound Mbps — cumulative bytes sampled every **30s**; ffmpeg stops **as soon as** **all five** consecutive **60s** averages in the last **5 minutes** are **strictly < `-DlnaIdleUploadMbpsThreshold`** (default **5** Mbps). Until **~305s** of samples exist, `w0`–`w4` stay **`n/a`** (condition not evaluated). **`-DlnaIdleStopMinutes` / `-DlnaIdleStopSeconds`** do not add delay in Wi-Fi mode (legacy `-DlnaIdleLegacyLastAccess` still uses idle duration). Deprecated: -DlnaIdleLegacyLastAccess uses NTFS LastAccessTime on segment files (see README).
-  Matches sibling PotPlayer RememberFiles defaults: `-ss`, `F:\f1_media\3d_fullsbs_trans` output
-  (Skybox DLNA path; when F: is missing, files live under %AppData%\3d_loop_segments and F: is subst'd for the run),
+  Matches sibling PotPlayer RememberFiles defaults: `-ss`, `M:\m1_media\3d_fullsbs_trans` output
+  (Skybox DLNA path; dummy subst prefer M: to %AppData%\m1_media_dlna_subst; files live under the 3d_fullsbs_trans junction),
   two rotating segment files (`3d_op_%02d.mkv`).
 
 .NOTES
   README.md: mapped-network input can bottleneck reads; DLNA idle (default Wi-Fi Mbps heuristic) is experimental.
   Console: Space pauses/resumes the segment remux (3d_op_*.mkv) via NtSuspend/NtResume; Enter stops ffmpeg and exits (130).
   DLNA Wi-Fi idle and run timeout (3600s) keep ticking while Space-paused; idle kill (~305s sample history + five low Mbps windows) is independent of ffmpeg suspend.
-  DLNA root: F:\f1_media\3d_fullsbs_trans via subst F: (%AppData%\f1_media_F_subst, shared with 3d_playlist_local). Reuses an existing AppData subst of F:; subst /d on quit only if this run created it. On quit: obfuscate then optional subst teardown; startup restores via Ensure-DlnaSegmentRoot.
+  DLNA root: M:\m1_media\3d_fullsbs_trans via dummy subst (prefer M:, %AppData%\m1_media_dlna_subst, shared with 3d_playlist_local). Reuses an existing AppData subst of that mount; subst /d on quit only if this run created it. Starts Skybox PC client if idle and maps 3d_fullsbs_trans. On quit: unmap Skybox share, obfuscate, then optional subst teardown; startup restores via Ensure-DlnaSegmentRoot.
 
 .PARAMETER LiteralPath
   Input file (Explorer passes %L expanded).
@@ -20,8 +20,8 @@
   **Deprecated (ignored).** Retained for context-menu compatibility; this path uses stream copy, not CBR video encode.
 
 .PARAMETER OutputDirectory
-  Default: F:\f1_media\3d_fullsbs_trans (Skybox DLNA share path; same default as the sibling project's ffmpeg segment launcher).
-  Recreated via %AppData%\3d_loop_segments + subst F: (physical F: is not used).
+  Default: M:\m1_media\3d_fullsbs_trans (Skybox DLNA share path; same dummy mount as 3d_playlist_local). Legacy F:\f1_media\3d_fullsbs_trans is retargeted.
+  Recreated via %AppData% + dummy subst (prefer M:; physical M: is not used).
 
 .PARAMETER SsMsOverride
   Seek ms when >= 0; default -1 uses RememberFiles registry for this path.
@@ -70,7 +70,7 @@ param(
     [Parameter(Mandatory = $false)]
     [string] $LiteralPath,
     [int] $TargetMbps = 100,
-    [string] $OutputDirectory = 'F:\f1_media\3d_fullsbs_trans',
+    [string] $OutputDirectory = 'M:\m1_media\3d_fullsbs_trans',
     [int] $SsMsOverride = -1,
     [string] $Ffmpeg = 'ffmpeg',
     [string] $LogFile = '',
@@ -644,11 +644,16 @@ if ($exitCode -eq $script:ExitCodeTimeout) {
 try {
     if (Get-Command Ensure-DlnaSegmentRoot -ErrorAction SilentlyContinue) {
         $ensuredRoot = Ensure-DlnaSegmentRoot -Force
+        if (Get-Command Convert-DlnaPlaceholderSharePath -ErrorAction SilentlyContinue) {
+            $OutputDirectory = Convert-DlnaPlaceholderSharePath -Path $OutputDirectory
+        }
         $preferredRoot = $script:DlnaSegmentRootPreferred
         if ([string]::IsNullOrWhiteSpace($preferredRoot)) {
-            $preferredRoot = 'F:\f1_media\3d_fullsbs_trans'
+            $preferredRoot = $ensuredRoot
         }
         if ([string]::IsNullOrWhiteSpace($OutputDirectory) -or
+            ((Get-Command Test-DlnaPlaceholderSharePath -ErrorAction SilentlyContinue) -and
+             (Test-DlnaPlaceholderSharePath -Path $OutputDirectory)) -or
             ($OutputDirectory.TrimEnd('\') -ieq $preferredRoot.TrimEnd('\'))) {
             $OutputDirectory = $ensuredRoot
         }
