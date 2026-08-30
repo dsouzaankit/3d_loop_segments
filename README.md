@@ -33,7 +33,7 @@ The preferred letter is **M:**. If **M:** is taken, a free **D–Z** letter is u
 
 On exit, **`Remove-DlnaSegmentRootSubst`** tears down dummy `{letter}:` **only if this run created the subst**. AppData data stays. After `subst`, the script also registers a PowerShell drive for that letter (provider cache does not pick up subst on its own; without that, `Join-Path` / `Test-Path` throw **Cannot find drive** and context-menu runs fail). Set **`3D_LOOP_SEGMENTS_SKIP_SKYBOX=1`** (or **`3D_PLAYLIST_SKIP_SKYBOX=1`**) to skip launching Skybox (mappings still sync if it is already up). Log/manual cleanup (`Cleanup-DlnaSegmentRoot.ps1`, obfuscate/clear helpers) calls **`Ensure-DlnaSegmentRoot -SkipSkyboxClient`**.
 
-Skybox start/stop and AirScreen mapping come from **`Get-LoopSegmentsSkybox.ps1`**, which **dot-sources** `SkyboxVrPc.UnmapPath.ps1`. This repo does **not** vendor `Skybox_vr_pc` as a git submodule (unlike `3d_playlist_local`). It loads the first existing tree among **`SKYBOX_VR_PC_ROOT`**, **`P:\all_scripts\Skybox_vr_pc`**, and a **`Skybox_vr_pc`** folder found by walking up from this script.
+Skybox start/stop and AirScreen mapping come from **`Get-LoopSegmentsSkybox.ps1`**, which **dot-sources** `SkyboxVrPc.UnmapPath.ps1` from the **`Skybox_vr_pc`** git submodule ([skybox-vr-pc](https://github.com/dsouzaankit/skybox-vr-pc)). After clone: **`git submodule update --init`**. Load order: **`SKYBOX_VR_PC_ROOT`**, then **`./Skybox_vr_pc`** (and parents), then **`P:\all_scripts\Skybox_vr_pc`**.
 
 ### Media obfuscation (quit / startup)
 
